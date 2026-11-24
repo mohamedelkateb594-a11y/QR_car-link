@@ -1,5 +1,5 @@
 rules_version = '2';
-// QR Car Contact - Firestore rules (Phase 1 draft, NOT yet run against the emulator).
+// QR Car Contact - Firestore rules (Phase 2 draft, NOT yet run against the emulator).
 // Principle: clients may READ only what belongs to them; every sensitive WRITE goes through Cloud Functions.
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -58,7 +58,9 @@ service cloud.firestore {
       allow write: if false;
 
       match /messages/{messageId} {
-        allow read: if isParticipant();   // message docs carry a denormalised `participants` array
+        // Decided via the parent request: a list query cannot prove a per-message `participants` field.
+        allow read: if signedIn()
+          && request.auth.uid in get(/databases/$(database)/documents/requests/$(requestId)).data.participants;
         allow write: if false;
       }
     }
