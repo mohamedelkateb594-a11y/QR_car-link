@@ -1,11 +1,11 @@
 # خطة تنفيذ QR Car Contact
 
-آخر تحديث: 2026-11-24 — المرحلة المنفذة: **Phase 1** (نواة الـ Backend)
+آخر تحديث: 2026-11-24 — المنفذ: **Phase 1** كاملة، و**Phase 2 جزئيًا** (الخدمات مختبرة، الـ adapters و`index.js` غير مشغّلة)
 
 ## 1. نتيجة مراجعة المشروع
 
-- المتوفر في هذه الجلسة: ملف المواصفات `QR_Car_Contact_Spec.md` فقط. **لم أجد كود أو مشروع Firebase/Android قائم**، فلم أعدّل أو أحذف أي ملف موجود.
-- لذلك بدأت هيكلًا جديدًا صغيرًا (`functions/` + `firestore.rules` + `firebase.json`). لو عندك مشروع قائم (مثلًا على GitHub)، الخطة قابلة للنقل لأن النواة JavaScript خالصة بدون اعتماد على Firebase.
+- الريبو القائم: `QR_car-link` (فرع `main`). كان يحتوي على مخرجات Phase 1 فقط، وأُضيفت عليه Phase 2 دون حذف أو إعادة كتابة لأي ملف قائم (عُدّل فقط `functions/index.js` وكان stub فارغًا، و`firestore.indexes.json` بإضافة فهارس).
+- لا يوجد كود Android ولا ويب حتى الآن.
 - المواصفات متسقة داخليًا. النقاط غير المحسومة موجودة في القسم 5 (افتراضات وقرارات).
 
 ## 2. القرارات المعمارية
@@ -15,7 +15,7 @@
 | **Firestore** وليس Realtime Database | قواعد أمان أدق لكل مستند، واستعلامات حسب المالك، وسهولة `onSnapshot` للرسائل والحالة. لن نستخدم الاثنين معًا. |
 | الزائر يدخل بـ **Firebase Anonymous Auth** | يعطي هوية ثابتة في المتصفح بدون حساب أو رقم هاتف، وتسمح للقواعد بحصر القراءة على صاحب الجلسة (`participants`). |
 | **كل الكتابة الحساسة عبر Cloud Functions** | إنشاء الطلب، الرسائل، الإغلاق، الإلغاء، الانتهاء. القواعد ترفض أي كتابة مباشرة من العميل، فلا يمكن إضافة رسالة لجلسة مغلقة. |
-| QR يحمل `رابط/token` عشوائي 192-bit | بدون بيانات شخصية. نخزّن **الـ hash فقط** في `qrTokens/{hash}`. |
+| QR يحمل `رابط/token` عشوائي 192-bit | بدون بيانات شخصية. البحث عبر `qrTokens/{sha256}`، ونخزن الـ token أيضًا في مستند السيارة لإعادة العرض (انظر D7). |
 | التنبيهات (30/60/90 ث) عبر **Cloud Tasks** | الـ scheduled functions أقل فترة لها دقيقة، فلا تكفي لـ 30 ثانية. كل Task يعيد فحص الحالة الحالية قبل الإرسال. |
 | الانتهاء (15 دقيقة) من الخادم | Task مجدول + **sweep** كل دقيقة كشبكة أمان، فلا يعتمد على فتح الصفحة أو التطبيق. |
 | ترويسات الاستضافة | `Referrer-Policy: no-referrer` حتى لا يتسرب الـ token من الرابط. |
@@ -24,9 +24,10 @@
 ## 3. نموذج البيانات (مقترح)
 
 - `users/{uid}`: `repeatEnabled`, `level`, `displayName` — و`devices/{deviceId}`: `token`, `platform`, `updatedAt`
-- `cars/{carId}`: `ownerUid`, `label`, `color`, `acceptingRequests`, `activeTokenHash`, `createdAt`
+- `cars/{carId}`: `ownerUid`, `label`, `color`, `acceptingRequests`, `qrToken`, `qrTokenHash`, `createdAt`
 - `qrTokens/{sha256}`: `carId`, `ownerUid`, `active`, `createdAt` — للخادم فقط
-- `requests/{requestId}`: `carId`, `ownerUid`, `visitorUid`, `participants[]`, `reason`, `message`, `status`, `createdAt`, `expiresAt`, `viewedAt`, `closedAt`
+- `requests/{requestId}`: `carId`, `ownerUid`, `visitorUid`, `participants[]`, `reason`, `message`, `status`, `open`, `createdAt`, `expiresAtMs`, `viewedAt`, `closedAt` (الأزمنة أرقام ms)
+- `rateEvents/{id}` (للخادم فقط): `carId`, `visitorUid`, `ipHash`, `at`
 - `requests/{id}/messages/{mid}`: `participants[]`, `from` (`owner`/`visitor`), `text`, `createdAt`
 
 ## 4. المراحل
@@ -34,11 +35,11 @@
 | # | المرحلة | الملفات الرئيسية | معيار الانتهاء |
 |---|---|---|---|
 | **1** ✅ | نواة الـ Backend: حالات الطلب، token، التحقق والـ sanitize، rate-limit، جدول التنبيهات، قواعد Firestore، إعدادات Firebase | `functions/src/core/*`، `functions/test/*`، `firestore.rules`، `firestore.indexes.json`، `firebase.json` | اختبارات الوحدة تنجح (تمّ). **القواعد لم تُختبر بعد.** |
-| 2 | ربط Cloud Functions + اختبارات Emulator | `functions/index.js` (+ تثبيت `firebase-admin` و`firebase-functions`)، اختبارات `rules-unit-testing` | callables: `createCar`, `rotateQr`, `createRequest`, `sendMessage`, `markViewed`, `closeRequest`, `cancelRequest`. Tasks: `alertTask`, `expireTask` + sweep. القواعد مختبرة على الـ Emulator. |
+| 2 🟡 | ربط Cloud Functions + اختبارات Emulator (الخدمات والاختبارات تمّت؛ تشغيل الـ adapters/Emulator لم يتم) | `functions/index.js` (+ تثبيت `firebase-admin` و`firebase-functions`)، اختبارات `rules-unit-testing` | callables: `createCar`, `rotateQr`, `createRequest`, `sendMessage`, `markViewed`, `closeRequest`, `cancelRequest`. Tasks: `processTask` (alert/expire) + sweep. القواعد مختبرة على الـ Emulator. |
 | 3 | صفحة الويب للزائر (RTL، عربي/إنجليزي) | `web/index.html` وملفاتها | معايير القبول 2، 3، 5، 6، 9، 12 على الـ Emulator |
 | 4 | أساس تطبيق Android: Gradle, Compose, تسجيل الدخول, السيارات, عرض/تنزيل/مشاركة QR, workflow لـ GitHub Actions | مشروع `android/` | تسجيل + سيارة + QR يفتح الرابط الصحيح (معيار 1) |
 | 5 | الطلبات داخل التطبيق: القائمة، التفاصيل، الشات اللحظي، زرا الإنهاء | `android/...` | معايير 5، 7، 8 |
-| 6 | الإشعارات: Notification Channel بصوت مخصص، تسجيل FCM token، التكرار القابل للضبط، إرشادات البطارية و DND | `android/...`، `alertTask` | معيار 10 على جهاز حقيقي |
+| 6 | الإشعارات: Notification Channel بصوت مخصص، تسجيل FCM token، التكرار القابل للضبط، إرشادات البطارية و DND | `android/...`، `processTask` | معيار 10 على جهاز حقيقي |
 | 7 | التقوية: App Check، سياسة الاحتفاظ (TTL)، سياسة الخصوصية، مصفوفة اختبار الحالات الحدية، اختبار قبول كامل | الكل | المعايير الـ 12 كلها مختبرة فعليًا |
 
 ## 5. الافتراضات والقرارات المفتوحة
@@ -58,6 +59,8 @@
 - **D4**: هل يوجد مشروع Firebase جاهز أم ننشئ جديدًا؟ (على حد علمي النشر لـ Functions وCloud Tasks يتطلب خطة Blaze.)
 - **D5**: **دومين روابط الـ QR** — لو طُبع QR على رابط `*.web.app` ثم تغيّر الدومين لاحقًا، تتعطل كل الأكواد المطبوعة. يُفضّل حسمه قبل الطباعة.
 - **D6**: مدة الاحتفاظ بالرسائل والطلبات (المواصفات تطلب مدة محددة ولم تذكرها).
+- **D7**: اعتماد تخزين الـ token الأصلي في مستند السيارة (للمالك فقط) لإعادة عرض الـ QR، بدل الـ hash فقط.
+- **D8**: منطقة (Region) نشر الـ Functions — لم تُحدَّد (الافتراضي `us-central1`).
 
 ## 6. تتبّع معايير القبول (القسم 13 من المواصفات)
 
