@@ -1,0 +1,71 @@
+rules_version = '2';
+// QR Car Contact - Firestore rules (Phase 1 draft, NOT yet run against the emulator).
+// Principle: clients may READ only what belongs to them; every sensitive WRITE goes through Cloud Functions.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    // Car owners sign in with a real provider; web visitors use Firebase Anonymous Auth.
+    function isOwnerAccount() {
+      return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+    function isParticipant() { return signedIn() && request.auth.uid in resource.data.participants; }
+
+    // Owner settings (alert preferences).
+    match /users/{uid} {
+      allow read: if isOwnerAccount() && request.auth.uid == uid;
+      allow create, update: if isOwnerAccount() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['repeatEnabled', 'level', 'displayName'])
+        && request.resource.data.get('repeatEnabled', true) is bool
+        && request.resource.data.get('level', 'standard') in ['off', 'light', 'standard']
+        && request.resource.data.get('displayName', '') is string
+        && request.resource.data.get('displayName', '').size() <= 60;
+      allow delete: if false;
+
+      // FCM tokens, one doc per device.
+      match /devices/{deviceId} {
+        allow read, delete: if isOwnerAccount() && request.auth.uid == uid;
+        allow create, update: if isOwnerAccount() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['token', 'platform', 'updatedAt'])
+          && request.resource.data.token is string
+          && request.resource.data.token.size() > 0 && request.resource.data.token.size() <= 4096
+          && request.resource.data.platform == 'android';
+      }
+    }
+
+    // Cars: owner reads; owner may edit only cosmetic fields. Create/delete/QR rotation = Cloud Functions only.
+    match /cars/{carId} {
+      allow read: if isOwnerAccount() && request.auth.uid == resource.data.ownerUid;
+      allow update: if isOwnerAccount() && request.auth.uid == resource.data.ownerUid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['label', 'color', 'acceptingRequests'])
+        && request.resource.data.get('acceptingRequests', true) is bool
+        && request.resource.data.get('label', '') is string
+        && request.resource.data.get('label', '').size() <= 60
+        && request.resource.data.get('color', '') is string
+        && request.resource.data.get('color', '').size() <= 30;
+      allow create, delete: if false;
+    }
+
+    // token-hash -> car lookup. Server only.
+    match /qrTokens/{hash} {
+      allow read, write: if false;
+    }
+
+    // Contact requests. Read by the two participants only; ALL writes via Cloud Functions
+    // (status transitions, closing, expiry, messages) so closed sessions can never accept data.
+    match /requests/{requestId} {
+      allow read: if isParticipant();
+      allow write: if false;
+
+      match /messages/{messageId} {
+        allow read: if isParticipant();   // message docs carry a denormalised `participants` array
+        allow write: if false;
+      }
+    }
+
+    // Everything else (rate-limit counters, internal state): server only.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
