@@ -1,17 +1,16 @@
 rules_version = '2';
 // QR Car Contact - Firestore rules (Phase 2 draft, NOT yet run against the emulator).
 // Principle: clients may READ only what belongs to them; every sensitive WRITE goes through Cloud Functions.
+// Decision K1: visitors read `sessions/{id}` (a mirror with NO ownerUid/carId); owners read `requests/{id}`.
 service cloud.firestore {
   match /databases/{database}/documents {
 
     function signedIn() { return request.auth != null; }
-    // Car owners sign in with a real provider; web visitors use Firebase Anonymous Auth.
     function isOwnerAccount() {
       return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
     }
-    function isParticipant() { return signedIn() && request.auth.uid in resource.data.participants; }
+    function requestDoc(id) { return get(/databases/$(database)/documents/requests/$(id)).data; }
 
-    // Owner settings (alert preferences).
     match /users/{uid} {
       allow read: if isOwnerAccount() && request.auth.uid == uid;
       allow create, update: if isOwnerAccount() && request.auth.uid == uid
@@ -22,7 +21,6 @@ service cloud.firestore {
         && request.resource.data.get('displayName', '').size() <= 60;
       allow delete: if false;
 
-      // FCM tokens, one doc per device.
       match /devices/{deviceId} {
         allow read, delete: if isOwnerAccount() && request.auth.uid == uid;
         allow create, update: if isOwnerAccount() && request.auth.uid == uid
@@ -33,7 +31,6 @@ service cloud.firestore {
       }
     }
 
-    // Cars: owner reads; owner may edit only cosmetic fields. Create/delete/QR rotation = Cloud Functions only.
     match /cars/{carId} {
       allow read: if isOwnerAccount() && request.auth.uid == resource.data.ownerUid;
       allow update: if isOwnerAccount() && request.auth.uid == resource.data.ownerUid
@@ -46,28 +43,27 @@ service cloud.firestore {
       allow create, delete: if false;
     }
 
-    // token-hash -> car lookup. Server only.
-    match /qrTokens/{hash} {
-      allow read, write: if false;
+    match /qrTokens/{hash} { allow read, write: if false; }
+
+    // Owner-private request (contains ownerUid, carId, visitorUid). Owner reads only; never the visitor.
+    match /requests/{requestId} {
+      allow read: if isOwnerAccount() && request.auth.uid == resource.data.ownerUid;
+      allow write: if false;
     }
 
-    // Contact requests. Read by the two participants only; ALL writes via Cloud Functions
-    // (status transitions, closing, expiry, messages) so closed sessions can never accept data.
-    match /requests/{requestId} {
-      allow read: if isParticipant();
+    // Visitor mirror: status/reason/expiry only. Visitor or the owning account may read.
+    match /sessions/{sessionId} {
+      allow read: if signedIn() && (request.auth.uid == resource.data.visitorUid
+                      || (isOwnerAccount() && request.auth.uid == requestDoc(sessionId).ownerUid));
       allow write: if false;
 
       match /messages/{messageId} {
-        // Decided via the parent request: a list query cannot prove a per-message `participants` field.
-        allow read: if signedIn()
-          && request.auth.uid in get(/databases/$(database)/documents/requests/$(requestId)).data.participants;
+        allow read: if signedIn() && (request.auth.uid == get(/databases/$(database)/documents/sessions/$(sessionId)).data.visitorUid
+                        || (isOwnerAccount() && request.auth.uid == requestDoc(sessionId).ownerUid));
         allow write: if false;
       }
     }
 
-    // Everything else (rate-limit counters, internal state): server only.
-    match /{document=**} {
-      allow read, write: if false;
-    }
+    match /{document=**} { allow read, write: if false; }
   }
 }

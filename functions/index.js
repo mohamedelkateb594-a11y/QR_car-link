@@ -1,94 +1,66 @@
 'use strict';
 /**
- * Firebase wiring (Phase 2). Business rules live in src/service.js; this file only adapts
- * Firebase callables / Cloud Tasks / scheduler to it. NOT yet run against the emulator.
+ * Cloud Functions wiring (Phase 2). NOT DEPLOYED / NOT TESTED: requires `npm install` (firebase-admin,
+ * firebase-functions v2) and a Firebase project (decision D4). All business rules live in src/services/service.js
+ * and are covered by unit tests; this file only adapts transport, auth and side-effect providers.
  */
-const { setGlobalOptions } = require('firebase-functions/v2');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { onTaskDispatched } = require('firebase-functions/v2/tasks');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
-const { defineString } = require('firebase-functions/params');
 const { initializeApp } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
 const { getFunctions } = require('firebase-admin/functions');
-
-const { createService } = require('./src/service');
-const { createFirestoreStore } = require('./src/firestoreStore');
-const { createNotifier } = require('./src/notifier');
-const { ServiceError } = require('./src/errors');
-
-setGlobalOptions({ region: 'europe-west1', maxInstances: 10 }); // region: adjust once the Firebase project (D4) is chosen
-const PUBLIC_BASE_URL = defineString('PUBLIC_BASE_URL'); // decision D5: the permanent QR domain
+const { createService } = require('./src/services/service');
+const { createFirestoreStore } = require('./src/services/firestoreStore');
+const { AppError } = require('./src/services/errors');
 
 initializeApp();
-const store = createFirestoreStore(getFirestore());
+const db = getFirestore();
+const BASE_URL = process.env.QR_BASE_URL; // decision D5: final QR domain must be fixed BEFORE printing
 
-let cached;
-const service = () => {
-  if (!cached) {
-    const queue = (name) => getFunctions().taskQueue(name);
-    cached = createService({
-      store,
-      baseUrl: PUBLIC_BASE_URL.value(),
-      notifier: createNotifier({ store, messaging: getMessaging() }),
-      scheduler: {
-        scheduleAlert: (id, index, delayMs) =>
-          queue('alertTask').enqueue({ requestId: id, index }, { scheduleDelaySeconds: Math.round(delayMs / 1000), id: `alert-${id}-${index}` }),
-        scheduleExpire: (id, delayMs) =>
-          queue('expireTask').enqueue({ requestId: id }, { scheduleDelaySeconds: Math.ceil(delayMs / 1000), id: `expire-${id}` }),
-      },
-    });
-  }
-  return cached;
+const CODE_MAP = { unauthenticated: 'unauthenticated', not_found: 'not-found', rate_limited: 'resource-exhausted', session_closed: 'failed-precondition' };
+
+const notifier = {
+  /** Sends FCM to every device of the owner. `accepted` only means FCM took it - NOT that the owner saw it. */
+  async push(uid, data) {
+    const devs = await db.collection('users').doc(uid).collection('devices').get();
+    const tokens = devs.docs.map((d) => d.data().token).filter(Boolean);
+    if (!tokens.length) return { accepted: false };
+    // Data-only + high priority so the app builds the notification on its custom channel (Phase 6).
+    const r = await getMessaging().sendEachForMulticast({ tokens, data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])), android: { priority: 'high' } });
+    return { accepted: r.successCount > 0 };
+  },
 };
 
-const HTTPS_CODE = {
-  unauthenticated: 'unauthenticated',
-  forbidden: 'permission-denied',
-  not_found: 'not-found',
-  rate_limited: 'resource-exhausted',
-  limit_reached: 'resource-exhausted',
-  message_limit: 'resource-exhausted',
-  session_closed: 'failed-precondition',
-  not_accepting: 'failed-precondition',
-  own_car: 'failed-precondition',
+const scheduler = {
+  async scheduleAlert(requestId, step, atMs) {
+    await getFunctions().taskQueue('alertTask').enqueue({ requestId, step }, { scheduleTime: new Date(atMs) });
+  },
+  async scheduleExpire(requestId, atMs) {
+    await getFunctions().taskQueue('expireTask').enqueue({ requestId }, { scheduleTime: new Date(atMs) });
+  },
 };
 
-const authOf = (req) => (req.auth ? { uid: req.auth.uid, provider: req.auth.token && req.auth.token.firebase && req.auth.token.firebase.sign_in_provider } : null);
+const svc = createService({ store: createFirestoreStore(db), notifier, scheduler, baseUrl: BASE_URL });
 
-const callable = (fn) => onCall(async (req) => {
-  try {
-    return await fn(authOf(req), req.data || {});
-  } catch (e) {
-    if (e instanceof ServiceError) throw new HttpsError(HTTPS_CODE[e.code] || 'invalid-argument', e.code, e.details);
-    console.error('unhandled_error', e);
-    throw new HttpsError('internal', 'internal');
+/** Wrap a service call: auth uid from the request, domain errors -> HttpsError with a stable code. */
+const callable = (fn) => onCall({ enforceAppCheck: false /* Phase 7: true */ }, async (req) => {
+  try { return await fn({ uid: req.auth && req.auth.uid, data: req.data || {}, req }); }
+  catch (e) {
+    if (e instanceof AppError) throw new HttpsError(CODE_MAP[e.code] || 'invalid-argument', e.code, e.details);
+    console.error(e); throw new HttpsError('internal', 'internal');
   }
 });
 
-// Owner (non-anonymous) callables
-exports.createCar = callable((a, d) => service().createCar(a, d));
-exports.rotateQr = callable((a, d) => service().rotateQr(a, d));
-exports.markViewed = callable((a, d) => service().markViewed(a, d));
-exports.ackDelivered = callable((a, d) => service().ackDelivered(a, d));
-exports.closeRequest = callable((a, d) => service().closeRequest(a, d));
-// Visitor (anonymous auth) callables
-exports.createRequest = callable((a, d) => service().createRequest(a, d));
-exports.cancelRequest = callable((a, d) => service().cancelRequest(a, d));
-// Both
-exports.sendMessage = callable((a, d) => service().sendMessage(a, d));
+exports.createCar = callable(({ uid, data }) => svc.createCar({ uid, label: data.label, color: data.color }));
+exports.rotateQr = callable(({ uid, data }) => svc.rotateQr({ uid, carId: data.carId }));
+exports.createRequest = callable(({ uid, data }) => svc.createRequest({ uid, token: data.token, payload: { reason: data.reason, message: data.message } }));
+exports.sendMessage = callable(({ uid, data }) => svc.sendMessage({ uid, requestId: data.requestId, text: data.text }));
+exports.markViewed = callable(({ uid, data }) => svc.markViewed({ uid, requestId: data.requestId }));
+exports.closeRequest = callable(({ uid, data }) => svc.closeRequest({ uid, requestId: data.requestId, kind: data.kind, note: data.note }));
+exports.cancelRequest = callable(({ uid, data }) => svc.cancelRequest({ uid, requestId: data.requestId }));
 
-// Cloud Tasks handlers (the service re-checks the CURRENT request state before acting)
-const retryConfig = { maxAttempts: 3, minBackoffSeconds: 5 };
-exports.alertTask = onTaskDispatched({ retryConfig, rateLimits: { maxConcurrentDispatches: 20 } }, async (req) => {
-  await service().fireAlert(req.data.requestId, req.data.index);
-});
-exports.expireTask = onTaskDispatched({ retryConfig, rateLimits: { maxConcurrentDispatches: 20 } }, async (req) => {
-  await service().expireRequest(req.data.requestId);
-});
-
-// Safety net: expires anything whose task was lost
-exports.expirySweep = onSchedule('every 1 minutes', async () => {
-  await service().sweepExpired();
-});
+exports.alertTask = onTaskDispatched({ retryConfig: { maxAttempts: 2 }, rateLimits: { maxConcurrentDispatches: 20 } }, (req) => svc.fireAlert(req.data));
+exports.expireTask = onTaskDispatched({ retryConfig: { maxAttempts: 3 } }, (req) => svc.expireRequest(req.data));
+exports.sweepExpired = onSchedule('every 1 minutes', () => svc.sweepExpired());
