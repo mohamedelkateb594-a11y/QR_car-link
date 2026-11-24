@@ -1,11 +1,11 @@
 'use strict';
-/** Domain error. `code` is a stable machine string; index.js maps it to an HttpsError code. */
+/** Domain error. `code` is a stable machine-readable string the clients can switch on. */
 class ServiceError extends Error {
-  constructor(code, extra = {}) {
+  constructor(code, details) {
     super(code);
     this.name = 'ServiceError';
     this.code = code;
-    Object.assign(this, extra);
+    this.details = details;
   }
 }
 module.exports = { ServiceError };

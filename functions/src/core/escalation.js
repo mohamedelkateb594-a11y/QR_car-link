@@ -13,7 +13,7 @@ const LEVELS = Object.freeze({
 
 function buildAlertSchedule(settings = {}) {
   const enabled = settings.repeatEnabled !== false;
-  const level = LEVELS[settings.level] ? settings.level : 'standard';
+  const level = Object.hasOwn(LEVELS, settings.level) ? settings.level : 'standard';
   return enabled ? LEVELS[level].slice() : LEVELS.off.slice();
 }
 

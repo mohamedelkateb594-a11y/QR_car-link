@@ -1,87 +1,94 @@
 'use strict';
 /**
- * Cloud Functions wiring (Phase 2). !! NOT DEPLOYED OR RUN: firebase-admin / firebase-functions could not be
- * installed in the authoring environment (no network). Business logic lives in src/services (unit-tested);
- * this file only adapts HTTP/auth/task plumbing. Verify on the Firebase Emulator before deploying.
+ * Firebase wiring (Phase 2). Business rules live in src/service.js; this file only adapts
+ * Firebase callables / Cloud Tasks / scheduler to it. NOT yet run against the emulator.
  */
-const crypto = require('node:crypto');
+const { setGlobalOptions } = require('firebase-functions/v2');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { onTaskDispatched } = require('firebase-functions/v2/tasks');
 const { onSchedule } = require('firebase-functions/v2/scheduler');
+const { defineString } = require('firebase-functions/params');
 const { initializeApp } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
 const { getFunctions } = require('firebase-admin/functions');
 
+const { createService } = require('./src/service');
+const { createFirestoreStore } = require('./src/firestoreStore');
+const { createNotifier } = require('./src/notifier');
 const { ServiceError } = require('./src/errors');
-const { DEFAULT_CONFIG } = require('./src/core/policy');
-const { createFirestoreStore } = require('./src/adapters/firestoreStore');
-const { createFcmPush } = require('./src/adapters/fcmPush');
-const { createCarService } = require('./src/services/carService');
-const { createRequestService } = require('./src/services/requestService');
+
+setGlobalOptions({ region: 'europe-west1', maxInstances: 10 }); // region: adjust once the Firebase project (D4) is chosen
+const PUBLIC_BASE_URL = defineString('PUBLIC_BASE_URL'); // decision D5: the permanent QR domain
 
 initializeApp();
-const db = getFirestore();
+const store = createFirestoreStore(getFirestore());
 
-const TASK_FUNCTION = 'processTask';
-const scheduler = {
-  enqueue: (payload, delayMs) =>
-    getFunctions().taskQueue(TASK_FUNCTION).enqueue(payload, { scheduleDelaySeconds: Math.max(0, Math.round(delayMs / 1000)) }),
+let cached;
+const service = () => {
+  if (!cached) {
+    const queue = (name) => getFunctions().taskQueue(name);
+    cached = createService({
+      store,
+      baseUrl: PUBLIC_BASE_URL.value(),
+      notifier: createNotifier({ store, messaging: getMessaging() }),
+      scheduler: {
+        scheduleAlert: (id, index, delayMs) =>
+          queue('alertTask').enqueue({ requestId: id, index }, { scheduleDelaySeconds: Math.round(delayMs / 1000), id: `alert-${id}-${index}` }),
+        scheduleExpire: (id, delayMs) =>
+          queue('expireTask').enqueue({ requestId: id }, { scheduleDelaySeconds: Math.ceil(delayMs / 1000), id: `expire-${id}` }),
+      },
+    });
+  }
+  return cached;
 };
-
-const store = createFirestoreStore(db);
-const common = { store, clock: { now: () => Date.now() }, newId: () => db.collection('_ids').doc().id };
-const requests = createRequestService({ ...common, push: createFcmPush({ db, messaging: getMessaging() }), scheduler, config: DEFAULT_CONFIG });
-// QR_BASE_URL must be the FINAL public origin (decision D5): printed QR codes depend on it.
-const cars = createCarService({ ...common, baseUrl: process.env.QR_BASE_URL });
 
 const HTTPS_CODE = {
-  invalid_payload: 'invalid-argument', invalid_reason: 'invalid-argument', invalid_text: 'invalid-argument',
-  message_too_long: 'invalid-argument', empty_message: 'invalid-argument', invalid_action: 'invalid-argument',
-  invalid_link: 'not-found', not_found: 'not-found', forbidden: 'permission-denied',
-  rate_limited: 'resource-exhausted', not_accepting: 'failed-precondition', session_closed: 'failed-precondition',
+  unauthenticated: 'unauthenticated',
+  forbidden: 'permission-denied',
+  not_found: 'not-found',
+  rate_limited: 'resource-exhausted',
+  limit_reached: 'resource-exhausted',
+  message_limit: 'resource-exhausted',
+  session_closed: 'failed-precondition',
+  not_accepting: 'failed-precondition',
+  own_car: 'failed-precondition',
 };
 
-function guarded(handler, { owner = false } = {}) {
-  return onCall(async (req) => {
-    if (!req.auth) throw new HttpsError('unauthenticated', 'sign_in_required');
-    const isAnonymous = req.auth.token.firebase.sign_in_provider === 'anonymous';
-    if (owner && isAnonymous) throw new HttpsError('permission-denied', 'owner_account_required');
-    const ip = (req.rawRequest && req.rawRequest.ip) || '';
-    // IP_HASH_SALT must be set (secret/param) or hashes are guessable. Only the salted hash is stored.
-    const ipHash = ip ? crypto.createHash('sha256').update(ip + (process.env.IP_HASH_SALT || '')).digest('hex') : null;
-    try {
-      return await handler(req.data || {}, { uid: req.auth.uid, isAnonymous, ipHash });
-    } catch (e) {
-      if (e instanceof ServiceError) {
-        throw new HttpsError(HTTPS_CODE[e.code] || 'failed-precondition', e.code, e.retryAfterMs ? { retryAfterMs: e.retryAfterMs } : undefined);
-      }
-      console.error(e);
-      throw new HttpsError('internal', 'internal');
-    }
-  });
-}
+const authOf = (req) => (req.auth ? { uid: req.auth.uid, provider: req.auth.token && req.auth.token.firebase && req.auth.token.firebase.sign_in_provider } : null);
 
-// Owner (signed-in, non-anonymous)
-exports.createCar = guarded((d, ctx) => cars.createCar(d, ctx), { owner: true });
-exports.rotateQr = guarded((d, ctx) => cars.rotateQr(d, ctx), { owner: true });
-exports.markViewed = guarded((d, ctx) => requests.markViewed(d, ctx), { owner: true });
-exports.closeRequest = guarded((d, ctx) => requests.closeRequest(d, ctx), { owner: true });
+const callable = (fn) => onCall(async (req) => {
+  try {
+    return await fn(authOf(req), req.data || {});
+  } catch (e) {
+    if (e instanceof ServiceError) throw new HttpsError(HTTPS_CODE[e.code] || 'invalid-argument', e.code, e.details);
+    console.error('unhandled_error', e);
+    throw new HttpsError('internal', 'internal');
+  }
+});
 
-// Visitor (anonymous auth) - role is derived from the uid stored on the request, not from the caller's claim
-exports.createRequest = guarded((d, ctx) => requests.createRequest(d, ctx));
-exports.cancelRequest = guarded((d, ctx) => requests.cancelRequest(d, ctx));
-exports.sendMessage = guarded((d, ctx) => requests.sendMessage(d, ctx));
+// Owner (non-anonymous) callables
+exports.createCar = callable((a, d) => service().createCar(a, d));
+exports.rotateQr = callable((a, d) => service().rotateQr(a, d));
+exports.markViewed = callable((a, d) => service().markViewed(a, d));
+exports.ackDelivered = callable((a, d) => service().ackDelivered(a, d));
+exports.closeRequest = callable((a, d) => service().closeRequest(a, d));
+// Visitor (anonymous auth) callables
+exports.createRequest = callable((a, d) => service().createRequest(a, d));
+exports.cancelRequest = callable((a, d) => service().cancelRequest(a, d));
+// Both
+exports.sendMessage = callable((a, d) => service().sendMessage(a, d));
 
-// Delayed alerts + expiry (Cloud Tasks). Each task re-checks current state before acting.
-exports[TASK_FUNCTION] = onTaskDispatched(
-  { retryConfig: { maxAttempts: 3, minBackoffSeconds: 5 }, rateLimits: { maxConcurrentDispatches: 20 } },
-  async (req) => {
-    const { kind, requestId, index } = req.data || {};
-    if (kind === 'alert') await requests.fireAlert(requestId, index);
-    else if (kind === 'expire') await requests.expireRequest(requestId);
-  },
-);
+// Cloud Tasks handlers (the service re-checks the CURRENT request state before acting)
+const retryConfig = { maxAttempts: 3, minBackoffSeconds: 5 };
+exports.alertTask = onTaskDispatched({ retryConfig, rateLimits: { maxConcurrentDispatches: 20 } }, async (req) => {
+  await service().fireAlert(req.data.requestId, req.data.index);
+});
+exports.expireTask = onTaskDispatched({ retryConfig, rateLimits: { maxConcurrentDispatches: 20 } }, async (req) => {
+  await service().expireRequest(req.data.requestId);
+});
 
-// Safety net: expires anything whose expiry task was lost.
-exports.sweepExpired = onSchedule('every 1 minutes', async () => { await requests.sweepExpired(); });
+// Safety net: expires anything whose task was lost
+exports.expirySweep = onSchedule('every 1 minutes', async () => {
+  await service().sweepExpired();
+});
