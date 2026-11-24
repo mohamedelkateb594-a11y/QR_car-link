@@ -1,7 +1,0 @@
-{
-  "name": "qr-car-contact-functions",
-  "private": true,
-  "main": "index.js",
-  "engines": { "node": "20" },
-  "scripts": { "test": "node --test" }
-}
