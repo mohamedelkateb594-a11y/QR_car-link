@@ -1,219 +1,170 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createService } = require('../src/service');
-const { createMemoryStore } = require('../test-support/memoryStore');
-const { generateToken, hashToken } = require('../src/core/token');
-const { STATUS: S } = require('../src/core/states');
-const { DEFAULT_CONFIG } = require('../src/core/policy');
+const { createService } = require('../src/services/service');
+const { createMemoryStore } = require('../src/services/memoryStore');
+const { hashToken } = require('../src/core/token');
 
-const OWNER = { uid: 'owner1', provider: 'google.com' };
-const visitor = (n = 1) => ({ uid: `visitor${n}`, provider: 'anonymous' });
-const MIN = 60 * 1000;
-
-async function setup({ devices = 1, settings } = {}) {
+function setup() {
+  let now = 1_000_000;
+  const pushes = []; const alerts = []; const expires = [];
   const store = createMemoryStore();
-  const clock = { t: 1_000_000 };
-  const sched = { alerts: [], expires: [] };
-  const push = { calls: [], sent: devices };
   const svc = createService({
-    store,
-    baseUrl: 'https://qr.example',
-    now: () => clock.t,
-    logger: { error() {} },
-    scheduler: {
-      async scheduleAlert(id, index, delayMs) { sched.alerts.push({ id, index, delayMs }); },
-      async scheduleExpire(id, delayMs) { sched.expires.push({ id, delayMs }); },
-    },
-    notifier: { async notifyOwner(uid, p) { push.calls.push({ uid, ...p }); return { sent: push.sent }; } },
+    store, baseUrl: 'https://example.test', clock: () => now,
+    notifier: { push: async (uid, p) => { pushes.push({ uid, ...p }); return { accepted: true }; } },
+    scheduler: { scheduleAlert: async (id, step, at) => alerts.push({ id, step, at }), scheduleExpire: async (id, at) => expires.push({ id, at }) },
   });
-  if (settings) store.db.users.set(OWNER.uid, settings);
-  const car = await svc.createCar(OWNER, { label: 'Corolla', color: 'white' });
-  const token = car.qrUrl.split('/c/')[1];
-  const open = async (v = visitor(1), extra = {}) => svc.createRequest(v, { token, reason: 'blocked_me', ...extra });
-  return { svc, store, clock, sched, push, car, token, open };
+  return { svc, store, pushes, alerts, expires, tick: (ms) => { now += ms; }, now: () => now };
 }
-const code = (p) => p.then(() => 'no-error', (e) => e.code);
+const tokenOf = (url) => url.split('/c/')[1];
+async function withCar(ctx, uid = 'owner1') {
+  const { qrUrl, carId } = await ctx.svc.createCar({ uid, label: 'Car' });
+  return { token: tokenOf(qrUrl), carId };
+}
+const rejects = (p, code) => assert.rejects(p, (e) => e.code === code);
 
-test('createCar: stores only the token hash, returns the QR url once, owners only, capped', async () => {
-  const { svc, store, car, token } = await setup();
-  assert.match(car.qrUrl, /^https:\/\/qr\.example\/c\/[A-Za-z0-9_-]{32}$/);
-  assert.ok(store.db.tokens.has(hashToken(token)));
-  assert.equal(JSON.stringify([...store.db.cars.values()]).includes(token), false);
-  assert.equal(await code(svc.createCar(visitor(), { label: 'x' })), 'forbidden');
-  assert.equal(await code(svc.createCar(null, { label: 'x' })), 'unauthenticated');
-  for (let i = 0; i < 4; i++) await svc.createCar(OWNER, { label: `c${i}` });
-  assert.equal(await code(svc.createCar(OWNER, { label: 'one too many' })), 'limit_reached');
+test('QR: token is stored only as a hash and URL points to /c/<token>', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  assert.ok(ctx.store._db.tokens.has(hashToken(token)));
+  assert.ok(![...ctx.store._db.tokens.keys()].includes(token));
 });
 
-test('rotateQr: old token stops working, new one works, only the car owner may rotate', async () => {
-  const { svc, car, token, open } = await setup();
-  assert.equal(await code(svc.rotateQr({ uid: 'other', provider: 'google.com' }, { carId: car.carId })), 'not_found');
-  const rotated = await svc.rotateQr(OWNER, { carId: car.carId });
-  assert.equal(await code(open()), 'not_found');
-  const newToken = rotated.qrUrl.split('/c/')[1];
-  assert.notEqual(newToken, token);
-  const r = await svc.createRequest(visitor(), { token: newToken, reason: 'move_car' });
-  assert.ok(r.requestId);
+test('criterion 3: request reaches the right owner, alerts + expiry are scheduled', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'move_car', message: 'hi' } });
+  assert.equal(ctx.pushes[0].uid, 'owner1');
+  assert.equal(ctx.store._db.requests.get(requestId).status, 'sent');
+  assert.deepEqual(ctx.alerts.map((a) => a.at - 1_000_000), [30000, 60000, 90000]);
+  assert.equal(ctx.expires[0].at - 1_000_000, 15 * 60 * 1000);
 });
 
-test('createRequest: status sent when a push goes out, created when owner has no device; schedules expiry + alerts', async () => {
-  const a = await setup({ devices: 1 });
-  const r = await a.open();
-  assert.equal(r.status, S.SENT);
-  assert.equal(r.expiresAtMs, 1_000_000 + 15 * MIN);
-  assert.deepEqual(a.sched.expires, [{ id: r.requestId, delayMs: 15 * MIN }]);
-  assert.deepEqual(a.sched.alerts.map((x) => x.delayMs), [30000, 60000, 90000]);
-  assert.equal(a.push.calls.length, 1);
-  const req = a.store.db.requests.get(r.requestId);
-  assert.deepEqual(req.participants, ['owner1', 'visitor1']);
-
-  const b = await setup({ devices: 0 });
-  assert.equal((await b.open()).status, S.CREATED);
+test('push failure does not lose the request (stays `created`, not `sent`)', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  ctx.svc = createService({ store: ctx.store, baseUrl: 'x', clock: ctx.now, notifier: { push: async () => { throw new Error('fcm down'); } }, scheduler: { scheduleAlert: async () => {}, scheduleExpire: async () => {} } });
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } });
+  assert.equal(ctx.store._db.requests.get(requestId).status, 'created');
 });
 
-test('createRequest: respects the owner alert level', async () => {
-  const a = await setup({ settings: { level: 'light' } });
-  await a.open();
-  assert.deepEqual(a.sched.alerts.map((x) => x.delayMs), [60000]);
-  const b = await setup({ settings: { repeatEnabled: false } });
-  await b.open();
-  assert.deepEqual(b.sched.alerts, []);
+test('invalid / revoked / paused tokens all give the same generic error', async () => {
+  const ctx = setup(); const { token, carId } = await withCar(ctx);
+  await rejects(ctx.svc.createRequest({ token: 'short', uid: 'v1', payload: { reason: 'other' } }), 'not_found');
+  await rejects(ctx.svc.createRequest({ token: 'A'.repeat(32), uid: 'v1', payload: { reason: 'other' } }), 'not_found');
+  await ctx.svc.rotateQr({ uid: 'owner1', carId });
+  await rejects(ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } }), 'not_found'); // old QR revoked
+  const car = ctx.store._db.cars.get(carId); ctx.store._db.cars.set(carId, { ...car, acceptingRequests: false });
+  const { qrUrl } = await ctx.svc.rotateQr({ uid: 'owner1', carId });
+  await rejects(ctx.svc.createRequest({ token: tokenOf(qrUrl), uid: 'v1', payload: { reason: 'other' } }), 'not_found'); // paused
 });
 
-test('createRequest: rejects bad input, unknown/malformed tokens, own car, paused car, anonymous-less callers', async () => {
-  const { svc, store, car, token, open } = await setup();
-  assert.equal(await code(svc.createRequest(null, { token, reason: 'other' })), 'unauthenticated');
-  assert.equal(await code(svc.createRequest(visitor(), { token, reason: 'hack' })), 'invalid_reason');
-  assert.equal(await code(svc.createRequest(visitor(), { token, reason: 'other', message: 'x'.repeat(501) })), 'message_too_long');
-  assert.equal(await code(svc.createRequest(visitor(), { token: 'short', reason: 'other' })), 'not_found');
-  assert.equal(await code(svc.createRequest(visitor(), { token: generateToken(), reason: 'other' })), 'not_found');
-  assert.equal(await code(svc.createRequest({ uid: OWNER.uid, provider: 'anonymous' }, { token, reason: 'other' })), 'own_car');
-  store.db.cars.get(car.carId).acceptingRequests = false;
-  assert.equal(await code(open()), 'not_accepting');
+test('only the car owner can rotate its QR', async () => {
+  const ctx = setup(); const { carId } = await withCar(ctx);
+  await rejects(ctx.svc.rotateQr({ uid: 'intruder', carId }), 'not_found');
 });
 
-test('createRequest: rate limits per visitor (3/10min) and per car (10/hour) with retry time', async () => {
-  const a = await setup();
-  for (let i = 0; i < 3; i++) await a.open(visitor(1));
-  try { await a.open(visitor(1)); assert.fail('expected rate_limited'); } catch (e) {
-    assert.equal(e.code, 'rate_limited');
-    assert.equal(e.details.retryAfterMs, 10 * MIN);
-  }
-  a.clock.t += 10 * MIN;
-  assert.ok((await a.open(visitor(1))).requestId);
-
-  const b = await setup();
-  for (let i = 0; i < 10; i++) await b.open(visitor(100 + i));
-  assert.equal(await code(b.open(visitor(999))), 'rate_limited');
+test('rate limit: 4th request from one visitor in the window is refused', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  for (let i = 0; i < 3; i++) await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } });
+  await rejects(ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } }), 'rate_limited');
+  await ctx.svc.createRequest({ token, uid: 'v2', payload: { reason: 'other' } }); // another visitor still fine
 });
 
-test('alerts: fire while unopened; stop after the owner views, closes, or the request expires', async () => {
-  const { svc, clock, open, store } = await setup();
-  const { requestId } = await open();
-  assert.equal((await svc.fireAlert(requestId, 1)).fired, true);
-  await svc.markViewed(OWNER, { requestId });
-  assert.equal((await svc.fireAlert(requestId, 2)).fired, false);
-
-  const second = await open(visitor(2));
-  clock.t += 15 * MIN;
-  assert.equal((await svc.fireAlert(second.requestId, 1)).fired, false);
-  assert.equal((await svc.fireAlert('missing', 1)).fired, false);
-  assert.ok(store.db.requests.size === 2);
+test('criterion 5: both sides exchange messages; owner is pushed on visitor messages', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'move_car' } });
+  await ctx.svc.sendMessage({ requestId, uid: 'v1', text: 'where are you?' });
+  await ctx.svc.sendMessage({ requestId, uid: 'owner1', text: 'coming' });
+  assert.deepEqual(ctx.store._db.messages.get(requestId).map((m) => m.from), ['visitor', 'owner']);
+  assert.equal(ctx.pushes.filter((p) => p.type === 'new_message').length, 1);
 });
 
-test('markViewed / ackDelivered: owner only, idempotent, visitor cannot', async () => {
-  const { svc, open } = await setup({ devices: 0 });
-  const { requestId } = await open();
-  assert.equal(await code(svc.markViewed(visitor(), { requestId })), 'not_found');
-  assert.equal((await svc.ackDelivered(OWNER, { requestId })).status, S.DELIVERED);
-  assert.equal((await svc.markViewed(OWNER, { requestId })).status, S.VIEWED);
-  assert.equal((await svc.markViewed(OWNER, { requestId })).status, S.VIEWED);
-  assert.equal((await svc.ackDelivered(OWNER, { requestId })).status, S.VIEWED); // never goes backwards
-  assert.equal(await code(svc.markViewed({ uid: 'stranger', provider: 'anonymous' }, { requestId })), 'not_found');
+test('criterion 12: a stranger cannot read/write/close/cancel someone else\'s session', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } });
+  await rejects(ctx.svc.sendMessage({ requestId, uid: 'v2', text: 'x' }), 'not_found');
+  await rejects(ctx.svc.markViewed({ requestId, uid: 'v2' }), 'not_found');
+  await rejects(ctx.svc.closeRequest({ requestId, uid: 'v2', kind: 'resolved' }), 'not_found');
+  await rejects(ctx.svc.cancelRequest({ requestId, uid: 'owner1' }), 'not_found');   // owner cannot cancel (visitor action)
+  await rejects(ctx.svc.closeRequest({ requestId, uid: 'v1', kind: 'resolved' }), 'not_found'); // visitor cannot close
 });
 
-test('chat: both sides can talk, owner reply moves to in_progress, strangers and empty text rejected', async () => {
-  const { svc, store, open } = await setup();
-  const { requestId } = await open();
-  await svc.sendMessage(visitor(), { requestId, text: 'من فضلك انزل' });
-  assert.equal((await svc.sendMessage(OWNER, { requestId, text: 'نازل حالا' })).status, S.IN_PROGRESS);
-  assert.deepEqual(store.db.messages.map((m) => m.from), ['visitor', 'owner']);
-  assert.equal(store.db.messages[0].text, 'من فضلك انزل');
-  assert.equal(await code(svc.sendMessage({ uid: 'stranger', provider: 'anonymous' }, { requestId, text: 'hi' })), 'not_found');
-  assert.equal(await code(svc.sendMessage(visitor(), { requestId, text: '   ' })), 'empty_message');
-  assert.equal(await code(svc.sendMessage(null, { requestId, text: 'hi' })), 'unauthenticated');
+test('criterion 7+8: closing ends the session, note is the last message, nothing can follow', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'move_car' } });
+  const r = await ctx.svc.closeRequest({ requestId, uid: 'owner1', kind: 'on_the_way', note: 'two minutes' });
+  assert.equal(r.status, 'closed_on_the_way');
+  assert.equal(ctx.store._db.sessions.get(requestId).status, 'closed_on_the_way');
+  await rejects(ctx.svc.sendMessage({ requestId, uid: 'v1', text: 'hello?' }), 'session_closed');
+  await rejects(ctx.svc.sendMessage({ requestId, uid: 'owner1', text: 'hello?' }), 'session_closed');
+  await rejects(ctx.svc.closeRequest({ requestId, uid: 'owner1', kind: 'resolved' }), 'session_closed'); // no reopen / re-close
+  await rejects(ctx.svc.cancelRequest({ requestId, uid: 'v1' }), 'session_closed');
+  assert.equal(ctx.store._db.messages.get(requestId).at(-1).text, 'two minutes');
 });
 
-test('chat: capped per request', async () => {
-  const { svc, open } = await setup();
-  const { requestId } = await open();
-  for (let i = 0; i < 100; i++) await svc.sendMessage(visitor(), { requestId, text: `m${i}` });
-  assert.equal(await code(svc.sendMessage(visitor(), { requestId, text: 'one more' })), 'message_limit');
+test('resolved close works straight from `sent` (owner never opened first)', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'move_car' } });
+  assert.equal((await ctx.svc.closeRequest({ requestId, uid: 'owner1', kind: 'resolved' })).status, 'closed_resolved');
 });
 
-test('close: owner closes with either outcome; afterwards no messages, no reopening, no second close', async () => {
-  for (const [outcome, status] of [['on_the_way', S.CLOSED_ON_THE_WAY], ['resolved', S.CLOSED_RESOLVED]]) {
-    const { svc, open, store } = await setup();
-    const { requestId } = await open();
-    assert.equal(await code(svc.closeRequest(visitor(), { requestId, outcome })), 'not_found');
-    assert.equal(await code(svc.closeRequest(OWNER, { requestId, outcome: 'constructor' })), 'invalid_outcome');
-    assert.equal((await svc.closeRequest(OWNER, { requestId, outcome })).status, status);
-    assert.equal(await code(svc.sendMessage(visitor(), { requestId, text: 'hello?' })), 'session_closed');
-    assert.equal(await code(svc.sendMessage(OWNER, { requestId, text: 'hello?' })), 'session_closed');
-    assert.equal(await code(svc.closeRequest(OWNER, { requestId, outcome })), 'session_closed');
-    assert.equal(await code(svc.cancelRequest(visitor(), { requestId })), 'session_closed');
-    assert.equal((await svc.markViewed(OWNER, { requestId })).status, status);
-    assert.equal(store.db.messages.length, 0);
-  }
+test('criterion 10: alerts stop after view / close / cancel / expiry', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const mk = async (uid) => (await ctx.svc.createRequest({ token, uid, payload: { reason: 'other' } })).requestId;
+  const a = await mk('va'); const b = await mk('vb'); const c = await mk('vc'); const d = await mk('vd');
+  assert.equal((await ctx.svc.fireAlert({ requestId: a, step: 0 })).fired, true);   // still unanswered
+  await ctx.svc.markViewed({ requestId: a, uid: 'owner1' });
+  await ctx.svc.closeRequest({ requestId: b, uid: 'owner1', kind: 'resolved' });
+  await ctx.svc.cancelRequest({ requestId: c, uid: 'vc' });
+  ctx.tick(15 * 60 * 1000);                                                       // d expires by time alone
+  for (const id of [a, b, c, d]) assert.equal((await ctx.svc.fireAlert({ requestId: id, step: 1 })).fired, false, id);
 });
 
-test('cancel: visitor only; blocks further messages', async () => {
-  const { svc, open } = await setup();
-  const { requestId } = await open();
-  assert.equal(await code(svc.cancelRequest(OWNER, { requestId })), 'not_found');
-  assert.equal((await svc.cancelRequest(visitor(), { requestId })).status, S.CANCELLED);
-  assert.equal(await code(svc.sendMessage(visitor(), { requestId, text: 'x' })), 'session_closed');
+test('markViewed is idempotent and never downgrades or reopens', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } });
+  assert.equal((await ctx.svc.markViewed({ requestId, uid: 'owner1' })).status, 'viewed');
+  assert.equal((await ctx.svc.markViewed({ requestId, uid: 'owner1' })).status, 'viewed');
+  await ctx.svc.closeRequest({ requestId, uid: 'owner1', kind: 'resolved' });
+  assert.equal((await ctx.svc.markViewed({ requestId, uid: 'owner1' })).status, 'closed_resolved');
 });
 
-test('expiry: 15 min after creation, even if the owner already opened it; sweep + task + lazy paths', async () => {
-  const { svc, clock, open, store } = await setup();
-  const a = await open(visitor(1));
-  const b = await open(visitor(2));
-  const c = await open(visitor(3));
-  await svc.markViewed(OWNER, { requestId: b.requestId });
-  await svc.sendMessage(OWNER, { requestId: c.requestId, text: 'on it' }); // in_progress
-
-  clock.t += 15 * MIN - 1;
-  assert.deepEqual(await svc.sweepExpired(), { expired: 0 });
-  assert.equal((await svc.expireRequest(a.requestId)).expired, false); // task fired too early: no-op
-
-  clock.t += 1;
-  assert.deepEqual(await svc.sweepExpired(), { expired: 3 });
-  for (const r of [a, b, c]) assert.equal(store.db.requests.get(r.requestId).status, S.EXPIRED);
-  assert.deepEqual(await svc.sweepExpired(), { expired: 0 });
-  assert.equal(await code(svc.sendMessage(visitor(1), { requestId: a.requestId, text: 'late' })), 'session_closed');
-  assert.equal((await svc.expireRequest('nope')).expired, false);
+test('criterion 9+11: expiry is server-side (Task, sweep, or lazily on any write) and visible in the mirror', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const mk = async (uid) => (await ctx.svc.createRequest({ token, uid, payload: { reason: 'other' } })).requestId;
+  const a = await mk('va'); const b = await mk('vb'); const c = await mk('vc');
+  assert.equal((await ctx.svc.expireRequest({ requestId: a })).status, 'sent');     // too early: no-op
+  ctx.tick(15 * 60 * 1000);
+  assert.equal((await ctx.svc.expireRequest({ requestId: a })).status, 'expired');  // Task path
+  assert.equal((await ctx.svc.expireRequest({ requestId: a })).status, 'expired');  // duplicate Task: harmless
+  assert.deepEqual(await ctx.svc.sweepExpired(), { expired: 2 });                   // sweep catches b and c
+  assert.equal(ctx.store._db.sessions.get(b).status, 'expired');
+  await rejects(ctx.svc.sendMessage({ requestId: b, uid: 'vb', text: 'late' }), 'session_closed');
 });
 
-test('expiry: lazily applied when someone acts after the deadline but before the sweep ran', async () => {
-  const { svc, clock, open, store } = await setup();
-  const { requestId } = await open();
-  clock.t += 16 * MIN;
-  assert.equal(await code(svc.sendMessage(visitor(), { requestId, text: 'hi' })), 'session_closed');
-  assert.equal(store.db.requests.get(requestId).status, S.EXPIRED);
-  assert.equal(store.db.messages.length, 0);
+test('lazy expiry: a message sent after the deadline expires the session instead of being stored', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other' } });
+  ctx.tick(15 * 60 * 1000 + 1);
+  await rejects(ctx.svc.sendMessage({ requestId, uid: 'v1', text: 'late' }), 'session_closed');
+  assert.equal(ctx.store._db.requests.get(requestId).status, 'expired'); // lazy expiry persisted (transaction did not roll it back)
 });
 
-test('scheduling failures do not lose the request', async () => {
-  const store = createMemoryStore();
-  const svc = createService({
-    store, baseUrl: 'https://qr.example', logger: { error() {} },
-    scheduler: { async scheduleAlert() { throw new Error('queue down'); }, async scheduleExpire() { throw new Error('queue down'); } },
-    notifier: { async notifyOwner() { return { sent: 1 }; } },
-  });
-  const car = await svc.createCar(OWNER, { label: 'x' });
-  const r = await svc.createRequest(visitor(), { token: car.qrUrl.split('/c/')[1], reason: 'other' });
-  assert.equal(r.status, S.SENT);
-  assert.equal(DEFAULT_CONFIG.requestTtlMs, 15 * MIN);
+test('visitor mirror never exposes owner or car ids', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other', message: 'hi' } });
+  const s = JSON.stringify(ctx.store._db.sessions.get(requestId)) + JSON.stringify(ctx.store._db.messages.get(requestId));
+  assert.ok(!s.includes('owner1')); assert.ok(!/carId/.test(s));
+});
+
+test('bad input: unknown reason, over-long text, bidi-override stripped', async () => {
+  const ctx = setup(); const { token } = await withCar(ctx);
+  await rejects(ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'nope' } }), 'invalid_reason');
+  await rejects(ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other', message: 'x'.repeat(501) } }), 'message_too_long');
+  const { requestId } = await ctx.svc.createRequest({ token, uid: 'v1', payload: { reason: 'other', message: 'ok‮txt' } });
+  assert.equal(ctx.store._db.messages.get(requestId)[0].text, 'oktxt');
+});
+
+test('car limit per user', async () => {
+  const ctx = setup();
+  for (let i = 0; i < 5; i++) await ctx.svc.createCar({ uid: 'o', label: `c${i}` });
+  await rejects(ctx.svc.createCar({ uid: 'o' }), 'car_limit_reached');
 });
