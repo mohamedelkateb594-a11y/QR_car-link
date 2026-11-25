@@ -24,7 +24,13 @@ import kotlinx.coroutines.launch
  */
 object Alerts {
     const val CHANNEL_SERVICE = "service"
-    const val CHANNEL_REQUESTS = "requests"
+
+    /**
+     * Android never changes the sound of a channel after it was created, so a channel that was first created
+     * without a sound stays silent forever. The id was bumped from "requests" to get a fresh channel with a sound.
+     */
+    const val CHANNEL_REQUESTS = "requests_v2"
+    private const val OLD_CHANNEL_REQUESTS = "requests"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val jobs = HashMap<String, Job>()
@@ -35,12 +41,17 @@ object Alerts {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_SERVICE, "التطبيق يعمل في الخلفية", NotificationManager.IMPORTANCE_LOW),
         )
+        nm.deleteNotificationChannel(OLD_CHANNEL_REQUESTS)
         val requests = NotificationChannel(CHANNEL_REQUESTS, "طلبات التواصل", NotificationManager.IMPORTANCE_HIGH).apply {
             description = "تنبيه عند وصول طلب تواصل بخصوص سيارتك"
             enableVibration(true)
             vibrationPattern = longArrayOf(0, 400, 200, 400)
+            // Default notification sound; if the phone has none set, fall back to the ringtone, then the alarm sound.
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
             setSound(
-                RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                uri,
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_NOTIFICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
