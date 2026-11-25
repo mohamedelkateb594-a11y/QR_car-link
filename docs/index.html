@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>التواصل مع صاحب السيارة</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap" id="app">
+  <header>
+    <div class="brand">
+      <div class="mark" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 16l1.5-5.5A2 2 0 0 1 8.4 9h7.2a2 2 0 0 1 1.9 1.5L19 16"/><rect x="3" y="16" width="18" height="4" rx="1.5"/><circle cx="7.5" cy="18" r=".6" fill="currentColor"/><circle cx="16.5" cy="18" r=".6" fill="currentColor"/></svg>
+      </div>
+      <div style="min-width:0"><h1 data-t="title"></h1><p class="sub" data-t="sub"></p></div>
+    </div>
+    <button class="lang" id="langBtn" type="button"></button>
+  </header>
+
+  <div class="card" id="fatalView" hidden><div class="banner bad" id="fatalMsg" role="alert"></div></div>
+
+  <form class="card" id="formView" novalidate hidden>
+    <div class="privacy">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 4.5-3.2 8.2-8 9-4.8-.8-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4"/></svg>
+      <span data-t="privacy"></span>
+    </div>
+    <fieldset>
+      <legend data-t="whyLegend"></legend>
+      <div id="reasons"></div>
+    </fieldset>
+    <div>
+      <label class="l" for="note" data-t="noteLabel"></label>
+      <textarea id="note" rows="3" maxlength="500"></textarea>
+      <div class="count"><span id="cnt">0</span>/500</div>
+    </div>
+    <p class="err" id="err" role="alert"></p>
+    <button class="btn" type="submit" id="submitBtn" data-t="send"></button>
+  </form>
+
+  <section id="sessionView" hidden>
+    <div class="card">
+      <ol class="steps" id="steps"></ol>
+      <div class="banner" id="banner" role="status"></div>
+      <div class="chat" id="chat" aria-live="polite"></div>
+      <form class="composer" id="composer">
+        <input type="text" id="msgInput" maxlength="500" autocomplete="off">
+        <button class="btn send" type="submit" id="msgBtn" data-t="sendMsg"></button>
+      </form>
+      <p class="err" id="sErr" role="alert"></p>
+      <button class="btn ghost" type="button" id="cancelBtn" data-t="cancel"></button>
+    </div>
+  </section>
+  <footer data-t="foot"></footer>
+</div>
+
+<!-- Firebase Web SDK (compat), pinned. Realtime Database only: no Cloud Functions, works on the free Spark plan. -->
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

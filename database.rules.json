@@ -1,0 +1,66 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "links": {
+      "$hash": {
+        ".read": "auth != null && data.child('ownerUid').val() === auth.uid",
+        ".write": "auth != null && auth.token.firebase.sign_in_provider !== 'anonymous' && ((newData.exists() && newData.child('ownerUid').val() === auth.uid && (!data.exists() || data.child('ownerUid').val() === auth.uid)) || (!newData.exists() && data.child('ownerUid').val() === auth.uid))",
+        ".validate": "$hash.matches(/^[a-f0-9]{64}$/) && newData.hasChildren(['ownerUid', 'carId', 'active'])",
+        "ownerUid": { ".validate": "newData.isString()" },
+        "carId": { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "active": { ".validate": "newData.isBoolean()" },
+        "$other": { ".validate": false }
+      }
+    },
+
+    "visitorState": {
+      "$uid": {
+        "lastAt": {
+          ".write": "auth != null && $uid === auth.uid && newData.val() === now && (!data.exists() || now - data.val() >= 60000)",
+          ".validate": "newData.isNumber()"
+        },
+        "$other": { ".validate": false }
+      }
+    },
+
+    "requests": {
+      "$hash": {
+        ".read": "auth != null && root.child('links').child($hash).child('ownerUid').val() === auth.uid",
+        ".indexOn": ["createdAt"],
+        "$rid": {
+          ".read": "auth != null && data.child('visitorUid').val() === auth.uid",
+          ".write": "auth != null && !data.exists() && newData.exists() && root.child('links').child($hash).child('active').val() === true && newData.child('visitorUid').val() === auth.uid && newData.child('status').val() === 'sent' && newData.child('createdAt').val() === now && newData.parent().parent().parent().child('visitorState').child(auth.uid).child('lastAt').val() === now",
+          ".validate": "newData.hasChildren(['visitorUid', 'reason', 'status', 'createdAt'])",
+          "visitorUid": { ".validate": "newData.isString()" },
+          "reason": { ".validate": "newData.isString() && newData.val().matches(/^(blocked_me|move_car|lights_on|issue|other)$/)" },
+          "note": { ".validate": "newData.isString() && newData.val().length <= 500" },
+          "createdAt": { ".validate": "newData.isNumber()" },
+          "status": {
+            ".write": "auth != null && data.exists() && newData.exists() && now < data.parent().child('createdAt').val() + 900000 && ((root.child('links').child($hash).child('ownerUid').val() === auth.uid && ((data.val() === 'sent' && newData.val() === 'viewed') || ((data.val() === 'sent' || data.val() === 'viewed') && (newData.val() === 'closed_on_the_way' || newData.val() === 'closed_resolved')))) || (data.parent().child('visitorUid').val() === auth.uid && (data.val() === 'sent' || data.val() === 'viewed') && newData.val() === 'cancelled'))",
+            ".validate": "newData.isString() && newData.val().matches(/^(sent|viewed|closed_on_the_way|closed_resolved|cancelled)$/)"
+          },
+          "$other": { ".validate": false }
+        }
+      }
+    },
+
+    "messages": {
+      "$hash": {
+        "$rid": {
+          ".read": "auth != null && (root.child('requests').child($hash).child($rid).child('visitorUid').val() === auth.uid || root.child('links').child($hash).child('ownerUid').val() === auth.uid)",
+          ".indexOn": ["createdAt"],
+          "$mid": {
+            ".write": "auth != null && !data.exists() && newData.exists() && (root.child('requests').child($hash).child($rid).child('status').val() === 'sent' || root.child('requests').child($hash).child($rid).child('status').val() === 'viewed') && now < root.child('requests').child($hash).child($rid).child('createdAt').val() + 900000 && ((newData.child('from').val() === 'visitor' && root.child('requests').child($hash).child($rid).child('visitorUid').val() === auth.uid) || (newData.child('from').val() === 'owner' && root.child('links').child($hash).child('ownerUid').val() === auth.uid))",
+            ".validate": "newData.hasChildren(['from', 'text', 'createdAt']) && newData.child('createdAt').val() === now",
+            "from": { ".validate": "newData.val() === 'visitor' || newData.val() === 'owner'" },
+            "text": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 500" },
+            "createdAt": { ".validate": "newData.isNumber()" },
+            "$other": { ".validate": false }
+          }
+        }
+      }
+    }
+  }
+}
