@@ -1,5 +1,6 @@
 package com.mohamed.qrcar
 
+import android.content.ClipData
 import android.content.Intent
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -37,6 +39,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -73,11 +76,18 @@ fun App() {
 private fun Main() {
     val s = Nav.screen
     BackHandler(enabled = s != Screen.Home) { Nav.screen = Screen.Home }
-    when (s) {
-        Screen.Home -> HomeScreen()
-        Screen.Settings -> SettingsScreen()
-        is Screen.Qr -> QrScreen(s.carId)
-        is Screen.Request -> RequestScreen(s.hash, s.rid)
+    Column(Modifier.fillMaxSize()) {
+        if (!Repo.connected) {
+            Text("لا يوجد اتصال — قد لا تصلك الطلبات الآن", color = Danger, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+        }
+        Column(Modifier.weight(1f)) {
+            when (s) {
+                Screen.Home -> HomeScreen()
+                Screen.Settings -> SettingsScreen()
+                is Screen.Qr -> QrScreen(s.carId)
+                is Screen.Request -> key(s.rid) { RequestScreen(s.hash, s.rid) }
+            }
+        }
     }
 }
 
@@ -100,6 +110,8 @@ private fun phaseText(phase: String): String = when (phase) {
     else -> phase
 }
 
+private fun carName(hash: String): String = Repo.cars.firstOrNull { it.hash == hash }?.label ?: ""
+
 private fun clock(ms: Long): String = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ms))
 
 @Composable
@@ -119,6 +131,7 @@ private fun Page(title: String, onBack: (() -> Unit)? = null, content: @Composab
 private fun LoginScreen() {
     var email by rememberSaveable { mutableStateOf("") }
     var password by rememberSaveable { mutableStateOf("") }
+    var notice by remember { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.Center) {
         Text("QR Car", style = MaterialTheme.typography.headlineMedium)
         Text("استقبل طلبات التواصل ممن يمسح رمز سيارتك دون مشاركة رقمك")
@@ -130,9 +143,14 @@ private fun LoginScreen() {
             visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
         )
         Repo.authError?.let { Text(it, color = Danger, modifier = Modifier.padding(top = 8.dp)) }
+        notice?.let { Text(it, modifier = Modifier.padding(top = 8.dp)) }
         Spacer(Modifier.height(16.dp))
         Button(onClick = { Repo.signIn(email, password) }, enabled = !Repo.busy, modifier = Modifier.fillMaxWidth()) { Text("تسجيل الدخول") }
         OutlinedButton(onClick = { Repo.signUp(email, password) }, enabled = !Repo.busy, modifier = Modifier.fillMaxWidth()) { Text("إنشاء حساب جديد") }
+        TextButton(onClick = {
+            Repo.authError = null
+            Repo.resetPassword(email) { notice = it }
+        }, modifier = Modifier.fillMaxWidth()) { Text("نسيت كلمة المرور؟") }
     }
 }
 
@@ -214,6 +232,7 @@ private fun RequestsTab() {
             Card(Modifier.fillMaxWidth().clickable { Nav.screen = Screen.Request(r.hash, r.id) }) {
                 Column(Modifier.padding(16.dp)) {
                     Text(Strs.reasons[r.reason] ?: r.reason, style = MaterialTheme.typography.titleMedium)
+                    Text(carName(r.hash))
                     Text(phaseText(r.phase(now)) + " • " + clock(r.createdAt))
                 }
             }
@@ -244,10 +263,25 @@ private fun QrScreen(carId: String) {
                 Switch(checked = Repo.active[car.hash] != false, onCheckedChange = { Repo.setActive(car, it) })
             }
             Spacer(Modifier.height(8.dp))
+            val name = "QR-" + car.label.replace(Regex("[^\\p{L}\\p{N}]+"), "_")
             Button(modifier = Modifier.fillMaxWidth(), onClick = {
-                val name = "QR-" + car.label.replace(Regex("[^\\p{L}\\p{N}]+"), "_")
-                info = if (saveQrToGallery(ctx, bmp, name)) "تم حفظ الصورة في الصور → QRCar" else "تعذر حفظ الصورة"
-            }) { Text("حفظ الـ QR كصورة") }
+                val saved = saveQrToGallery(ctx, printableCard(bmp), name)
+                info = if (saved != null) "تم حفظ الصورة في الصور → QRCar" else "تعذر حفظ الصورة"
+            }) { Text("حفظ بطاقة الـ QR للطباعة") }
+            OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
+                val saved = saveQrToGallery(ctx, printableCard(bmp), name)
+                if (saved == null) {
+                    info = "تعذر تجهيز الصورة"
+                } else {
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "image/png"
+                        putExtra(Intent.EXTRA_STREAM, saved)
+                        clipData = ClipData.newRawUri("QR", saved)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    ctx.startActivity(Intent.createChooser(send, null))
+                }
+            }) { Text("مشاركة صورة الرمز") }
             OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
                 val send = Intent(Intent.ACTION_SEND).apply {
                     type = "text/plain"
@@ -298,11 +332,17 @@ private fun RequestScreen(hash: String, rid: String) {
     var text by remember { mutableStateOf("") }
     var err by remember { mutableStateOf<String?>(null) }
     var closing by remember { mutableStateOf(false) }
+    val chat = rememberLazyListState()
+    LaunchedEffect(msgs.size) {
+        if (msgs.isNotEmpty()) chat.animateScrollToItem(msgs.size - 1)
+    }
+    val ctx = LocalContext.current
 
     DisposableEffect(hash, rid) {
         val off = Repo.watchMessages(hash, rid) { msgs = it }
         onDispose { off() }
     }
+    LaunchedEffect(rid, msgs.size) { Alerts.stopMessage(ctx, rid) }
     // Opening a new request tells the visitor it was seen and stops the repeating alerts.
     LaunchedEffect(rid, r != null) {
         val cur = Repo.current(rid)
@@ -316,16 +356,20 @@ private fun RequestScreen(hash: String, rid: String) {
         }
         val open = r.isOpen(now)
         Text(Strs.reasons[r.reason] ?: r.reason, style = MaterialTheme.typography.titleMedium)
+        Text(carName(r.hash), style = MaterialTheme.typography.labelMedium)
         if (r.note.isNotEmpty()) Text(r.note)
         val left = if (open) " • تنتهي خلال " + Strs.fmt((r.createdAt + Repo.TTL_MS - now) / 1000) else ""
         Text(phaseText(r.phase(now)) + left)
         Spacer(Modifier.height(8.dp))
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = chat, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             items(msgs, key = { it.id }) { m ->
-                Card(Modifier.fillMaxWidth(0.85f)) {
-                    Column(Modifier.padding(10.dp)) {
-                        Text(if (m.from == "owner") "أنت" else "الزائر", style = MaterialTheme.typography.labelSmall)
-                        Text(m.text)
+                val mine = m.from == "owner"
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.Start else Arrangement.End) {
+                    Card(Modifier.fillMaxWidth(0.85f)) {
+                        Column(Modifier.padding(10.dp)) {
+                            Text((if (mine) "أنت" else "الزائر") + " • " + clock(m.createdAt), style = MaterialTheme.typography.labelSmall)
+                            Text(m.text)
+                        }
                     }
                 }
             }
@@ -333,7 +377,7 @@ private fun RequestScreen(hash: String, rid: String) {
         err?.let { Text(it, color = Danger) }
         if (open) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(text, { text = it }, Modifier.weight(1f), placeholder = { Text("اكتب ردًّا…") })
+                OutlinedTextField(text, { text = it }, Modifier.weight(1f), placeholder = { Text("اكتب ردًّا…") })
                 TextButton(onClick = {
                     Repo.sendMessage(r, text) { e ->
                         if (e == null) {

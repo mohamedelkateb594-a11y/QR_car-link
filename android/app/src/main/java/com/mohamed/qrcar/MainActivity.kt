@@ -22,6 +22,11 @@ sealed interface Screen {
 
 object Nav {
     var screen by mutableStateOf<Screen>(Screen.Home)
+
+    /** True while the activity is on screen. */
+    var visible = false
+
+    fun isShowing(rid: String): Boolean = visible && (screen as? Screen.Request)?.rid == rid
 }
 
 class MainActivity : ComponentActivity() {
@@ -34,8 +39,22 @@ class MainActivity : ComponentActivity() {
         ) {
             askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-        handle(intent)
+        // On recreation (rotation, theme change) the old intent must not override where the user is now.
+        if (savedInstanceState == null) handle(intent)
         setContent { App() }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        Nav.visible = true
+        (Nav.screen as? Screen.Request)?.let { Alerts.stopMessage(this, it.rid) }
+        // Android may have refused or stopped the background service; being visible is a safe moment to restart it.
+        if (Repo.uid != null && Repo.cars.isNotEmpty()) Alerts.startService(this)
+    }
+
+    override fun onStop() {
+        Nav.visible = false
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {

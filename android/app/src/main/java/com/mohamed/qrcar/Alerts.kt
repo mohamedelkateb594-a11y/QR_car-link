@@ -55,17 +55,21 @@ object Alerts {
         if (!handled.add(r.id)) return
         val app = ctx.applicationContext
         jobs[r.id] = scope.launch {
-            val offsets = if (Repo.repeatAlerts) listOf(0L, 30_000L, 60_000L, 90_000L) else listOf(0L)
+            val repeats = if (Repo.repeatAlerts) listOf(30_000L, 60_000L, 90_000L) else emptyList()
             val now = Repo.serverNow()
-            // Offsets already in the past are skipped, but a request seen late still alerts once, immediately.
-            val pending = offsets.filter { r.createdAt + it >= now - 1_000L }.ifEmpty { listOf(0L) }
+            // The first alert is always immediate (even if the request arrives late); only future repeats follow.
+            val pending = listOf(0L) + repeats.filter { r.createdAt + it > now }
             for (off in pending) {
                 val wait = r.createdAt + off - Repo.serverNow()
-                if (wait > 0) delay(wait)
+                if (off > 0 && wait > 0) delay(wait)
                 val cur = Repo.current(r.id) ?: break
                 if (cur.status != "sent" || !cur.isOpen(Repo.serverNow())) break
                 notify(app, cur)
             }
+            // An unopened request disappears from the notification shade once it expires.
+            val left = r.createdAt + Repo.TTL_MS - Repo.serverNow()
+            if (left > 0) delay(left)
+            NotificationManagerCompat.from(app).cancel(r.id.hashCode())
             jobs.remove(r.id)
         }
     }
@@ -75,6 +79,23 @@ object Alerts {
         NotificationManagerCompat.from(ctx).cancel(id.hashCode())
     }
 
+    /** One notification per new visitor message; silent about the request the owner is currently reading. */
+    fun message(ctx: Context, r: Req, mid: String, text: String, createdAt: Long) {
+        val prefs = ctx.getSharedPreferences("qrcar", Context.MODE_PRIVATE)
+        if (prefs.getString("msg:${r.id}", null) == mid) return
+        prefs.edit().putString("msg:${r.id}", mid).apply()
+        if (Nav.isShowing(r.id)) return
+        // Messages older than a minute were most likely seen on another phone or before a reinstall.
+        if (Repo.serverNow() - createdAt > 60_000L) return
+        post(ctx, r, messageId(r.id), "رسالة جديدة من الزائر", text)
+    }
+
+    fun stopMessage(ctx: Context, id: String) {
+        NotificationManagerCompat.from(ctx).cancel(messageId(id))
+    }
+
+    private fun messageId(rid: String): Int = "msg:$rid".hashCode()
+
     fun resetAll(ctx: Context) {
         jobs.values.forEach { it.cancel() }
         jobs.clear()
@@ -83,6 +104,10 @@ object Alerts {
     }
 
     private fun notify(ctx: Context, r: Req) {
+        post(ctx, r, r.id.hashCode(), "طلب تواصل جديد", Strs.reasons[r.reason] ?: Strs.reasons.getValue("other"))
+    }
+
+    private fun post(ctx: Context, r: Req, id: Int, title: String, body: String) {
         val nm = NotificationManagerCompat.from(ctx)
         if (!nm.areNotificationsEnabled()) return
         val open = Intent(ctx, MainActivity::class.java).apply {
@@ -91,12 +116,13 @@ object Alerts {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
         }
         val pi = PendingIntent.getActivity(
-            ctx, r.id.hashCode(), open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            ctx, id, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val n = NotificationCompat.Builder(ctx, CHANNEL_REQUESTS)
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle("طلب تواصل جديد")
-            .setContentText(Strs.reasons[r.reason] ?: Strs.reasons.getValue("other"))
+            .setContentTitle(title)
+            .setContentText(body)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setAutoCancel(true)
@@ -104,7 +130,7 @@ object Alerts {
             .setContentIntent(pi)
             .build()
         try {
-            nm.notify(r.id.hashCode(), n)
+            nm.notify(id, n)
         } catch (e: SecurityException) {
             // POST_NOTIFICATIONS revoked while running: nothing to do.
         }

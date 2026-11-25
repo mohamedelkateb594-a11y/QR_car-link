@@ -6,7 +6,7 @@
     "links": {
       "$hash": {
         ".read": "auth != null && data.child('ownerUid').val() === auth.uid",
-        ".write": "auth != null && auth.token.firebase.sign_in_provider !== 'anonymous' && ((newData.exists() && newData.child('ownerUid').val() === auth.uid && (!data.exists() || data.child('ownerUid').val() === auth.uid)) || (!newData.exists() && data.child('ownerUid').val() === auth.uid))",
+        ".write": "auth != null && auth.token.firebase.sign_in_provider !== 'anonymous' && newData.exists() && newData.child('ownerUid').val() === auth.uid && (!data.exists() || data.child('ownerUid').val() === auth.uid)",
         ".validate": "$hash.matches(/^[a-f0-9]{64}$/) && newData.hasChildren(['ownerUid', 'carId', 'active'])",
         "ownerUid": { ".validate": "newData.isString()" },
         "carId": { ".validate": "newData.isString() && newData.val().length <= 64" },
@@ -15,11 +15,32 @@
       }
     },
 
+    "owners": {
+      "$uid": {
+        ".read": "auth != null && $uid === auth.uid && auth.token.firebase.sign_in_provider !== 'anonymous'",
+        "cars": {
+          "$carId": {
+            ".write": "auth != null && $uid === auth.uid && auth.token.firebase.sign_in_provider !== 'anonymous'",
+            ".validate": "$carId.length <= 64 && newData.hasChildren(['updatedAt']) && (newData.child('deleted').val() === true || newData.hasChildren(['label', 'token']))",
+            "label": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 60" },
+            "token": { ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9_-]{32}$/)" },
+            "updatedAt": { ".validate": "newData.isNumber()" },
+            "deleted": { ".validate": "newData.isBoolean()" },
+            "$other": { ".validate": false }
+          }
+        }
+      }
+    },
+
     "visitorState": {
       "$uid": {
         "lastAt": {
           ".write": "auth != null && $uid === auth.uid && newData.val() === now && (!data.exists() || now - data.val() >= 60000)",
           ".validate": "newData.isNumber()"
+        },
+        "lastKey": {
+          ".write": "auth != null && $uid === auth.uid && newData.parent().child('lastAt').val() === now",
+          ".validate": "newData.isString() && newData.val().length <= 128"
         },
         "$other": { ".validate": false }
       }
@@ -31,7 +52,7 @@
         ".indexOn": ["createdAt"],
         "$rid": {
           ".read": "auth != null && data.child('visitorUid').val() === auth.uid",
-          ".write": "auth != null && !data.exists() && newData.exists() && root.child('links').child($hash).child('active').val() === true && newData.child('visitorUid').val() === auth.uid && newData.child('status').val() === 'sent' && newData.child('createdAt').val() === now && newData.parent().parent().parent().child('visitorState').child(auth.uid).child('lastAt').val() === now",
+          ".write": "auth != null && !data.exists() && newData.exists() && root.child('links').child($hash).child('active').val() === true && newData.child('visitorUid').val() === auth.uid && newData.child('status').val() === 'sent' && newData.child('createdAt').val() === now && newData.parent().parent().parent().child('visitorState').child(auth.uid).child('lastAt').val() === now && newData.parent().parent().parent().child('visitorState').child(auth.uid).child('lastKey').val() === $hash + '/' + $rid",
           ".validate": "newData.hasChildren(['visitorUid', 'reason', 'status', 'createdAt'])",
           "visitorUid": { ".validate": "newData.isString()" },
           "reason": { ".validate": "newData.isString() && newData.val().matches(/^(blocked_me|move_car|lights_on|issue|other)$/)" },
