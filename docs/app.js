@@ -3,7 +3,7 @@
    database.rules.json (state transitions, expiry by server time, cooldown). The page never sees the owner's uid or phone. */
 const REASONS = ['blocked_me', 'move_car', 'lights_on', 'issue', 'other'];
 const T = {
-  ar: { title: 'التواصل مع صاحب السيارة', sub: 'بدون تسجيل وبدون تنزيل تطبيق',
+  ar: { title: 'التواصل مع صاحب السيارة', loading: 'جارٍ التحميل…', sub: 'بدون تسجيل وبدون تنزيل تطبيق',
     privacy: 'رقم هاتفك لا يظهر لصاحب السيارة، ورقمه لا يظهر لك. الرسائل تنتهي مع انتهاء الطلب.',
     whyLegend: 'سبب التواصل', noteLabel: 'رسالة (اختيارية)', send: 'إرسال الطلب', sending: 'جارٍ الإرسال…', sendMsg: 'إرسال', msgPh: 'اكتب رسالة…',
     pick: 'اختر سبب التواصل أولًا.', cancel: 'إلغاء الطلب',
@@ -20,7 +20,7 @@ const T = {
     e_msg_denied: 'تعذّر إرسال الرسالة. ربما انتهى الطلب.',
     e_generic: 'تعذّر الاتصال. تحقق من الإنترنت وحاول مرة أخرى.',
     foot: 'QR Car Contact' },
-  en: { title: 'Contact the car owner', sub: 'No sign-up, no app to install',
+  en: { title: 'Contact the car owner', loading: 'Loading…', sub: 'No sign-up, no app to install',
     privacy: 'Your phone number is never shown to the owner, and theirs is never shown to you. Messages end with the request.',
     whyLegend: 'Reason for contact', noteLabel: 'Message (optional)', send: 'Send request', sending: 'Sending…', sendMsg: 'Send', msgPh: 'Write a message…',
     pick: 'Choose a reason first.', cancel: 'Cancel request',
@@ -76,7 +76,7 @@ function applyLang() {
   });
   if (req) render();
 }
-function showOnly(id) { for (const v of ['fatalView', 'formView', 'sessionView']) $(v).hidden = v !== id; }
+function showOnly(id) { for (const v of ['loadView', 'fatalView', 'formView', 'sessionView']) $(v).hidden = v !== id; }
 function fatal(key) { $('fatalMsg').textContent = T[lang][key]; showOnly('fatalView'); }
 
 // Expiry is derived from server time (createdAt + 15 min): the rules refuse any write after that moment.
@@ -169,7 +169,9 @@ $('formView').addEventListener('submit', async (e) => {
   const body = { visitorUid: auth.currentUser.uid, reason: REASONS[+r.value], status: 'sent', createdAt: TS() };
   if (note) body.note = note;
   try {
-    await db.ref().update({ ['requests/' + hash + '/' + id]: body, ['visitorState/' + auth.currentUser.uid + '/lastAt']: TS() });
+    await db.ref().update({ ['requests/' + hash + '/' + id]: body, ['visitorState/' + auth.currentUser.uid + '/lastAt']: TS(),
+      // The rules accept exactly the one request named here, so a single write cannot create a flood of requests.
+      ['visitorState/' + auth.currentUser.uid + '/lastKey']: hash + '/' + id });
     attach(id);
   } catch (err) { $('err').textContent = T[lang].e_denied; }
   finally { busy = false; $('submitBtn').disabled = false; $('submitBtn').textContent = T[lang].send; }

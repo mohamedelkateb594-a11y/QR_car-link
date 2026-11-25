@@ -21,6 +21,8 @@
     <button class="lang" id="langBtn" type="button"></button>
   </header>
 
+  <div class="card" id="loadView"><p class="empty" role="status" data-t="loading">جارٍ التحميل…</p></div>
+
   <div class="card" id="fatalView" hidden><div class="banner bad" id="fatalMsg" role="alert"></div></div>
 
   <form class="card" id="formView" novalidate hidden>
@@ -54,6 +56,7 @@
       <button class="btn ghost" type="button" id="cancelBtn" data-t="cancel"></button>
     </div>
   </section>
+  <noscript><div class="card"><div class="banner bad">فعّل JavaScript لإرسال الطلب.</div></div></noscript>
   <footer data-t="foot"></footer>
 </div>
 
