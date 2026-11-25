@@ -1,12 +1,8 @@
-# Ready-to-install CI for the Android APK.
-# The GitHub integration used to push this repo cannot create files under .github/workflows (403), so it is parked here.
-# To activate: GitHub > Add file > Create new file > name it  .github/workflows/android.yml  > paste this content > Commit.
-# Then Actions > "Android build" > Run workflow. The APK appears under the run's Artifacts.
 name: Android build
 
 on:
   push:
-    branches: ['android-app', 'android-app-complete']
+    branches: ['android-app', 'android-app-complete', 'fix-alert-sound']
     paths: ['android/**', '.github/workflows/android.yml']
   workflow_dispatch:
 
@@ -19,7 +15,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # The repo has no Gradle wrapper, so install a Gradle that matches AGP 8.5.2 (needs 8.7+).
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
