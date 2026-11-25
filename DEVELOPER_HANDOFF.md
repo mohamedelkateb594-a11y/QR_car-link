@@ -23,8 +23,8 @@
 |---|---|
 | `rules-tests/` (15 اختبارًا) على محاكي مبسّط محلي للقواعد | ناجحة — **ليس** Firebase Emulator |
 | صفحة الزائر في Chromium على قاعدة بيانات محاكاة (إرسال، مشاهدة، رسائل، إغلاق، رابط خاطئ) | ناجحة |
-| `rules-tests/` على Firebase Emulator | يُشغَّل في GitHub Actions — راجع النتيجة |
-| بناء الـ APK | يُشغَّل في GitHub Actions — راجع النتيجة (لا يوجد Android SDK في بيئة التطوير) |
+| `rules-tests/` على Firebase Emulator | **لم تُنفّذ** — فعّل `docs/rules-ci.yml.txt` |
+| بناء الـ APK | **لم يُنفّذ** — Actions ← Android build ← Run workflow (لا يوجد Android SDK في بيئة التطوير) |
 | تجربة على هاتف حقيقي ومشروع Firebase الحقيقي | **لم تُنفّذ** |
 | `functions/` (النسخة القديمة غير المستخدمة) | `node --test`: ‏64 ناجح و2 فاشل، لم تُعدّل |
 
