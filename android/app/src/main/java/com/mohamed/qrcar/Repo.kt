@@ -26,7 +26,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Everything that talks to Firebase (Auth + Realtime Database) plus the car list kept on this phone.
+ * Everything that talks to Firebase (Auth + Realtime Database) plus the car list cached on this phone.
  * All protection lives in database.rules.json; this object only performs the writes those rules allow.
  */
 object Repo {
@@ -59,11 +59,19 @@ object Repo {
     val cars = mutableStateListOf<Car>()
     val requests = mutableStateListOf<Req>()
 
+    /** False while the database connection is down. Car changes are refused then instead of hanging. */
+    var connected by mutableStateOf(false)
+        private set
+
     /** links/<hash>/active as last seen (false = paused). Missing = unknown, treated as active. */
     val active = mutableStateMapOf<String, Boolean>()
 
     private var skew = 0L
     private val handles = mutableListOf<() -> Unit>()
+    private var carsHandle: (() -> Unit)? = null
+    private val messageHandles = HashMap<String, () -> Unit>()
+    private val uploaded = HashSet<String>()
+    private const val OFFLINE = "لا يوجد اتصال بقاعدة البيانات. تحقق من الإنترنت وحاول مرة أخرى"
 
     fun serverNow(): Long = System.currentTimeMillis() + skew
     fun linkFor(car: Car): String = PAGE_BASE + "#" + car.token
@@ -86,15 +94,23 @@ object Repo {
             override fun onDataChange(snapshot: DataSnapshot) { skew = snapshot.getValue(Long::class.java) ?: 0L }
             override fun onCancelled(error: DatabaseError) {}
         })
+        db.getReference(".info/connected").addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) { connected = snapshot.getValue(Boolean::class.java) ?: false }
+            override fun onCancelled(error: DatabaseError) {}
+        })
         auth.addAuthStateListener { onAuth(it.currentUser) }
     }
 
     // ---------- auth ----------
     private fun onAuth(user: FirebaseUser?) {
+        val u = user?.takeIf { !it.isAnonymous }?.uid
+        if (u != null && u == uid) return
         detachAll()
+        carsHandle?.invoke()
+        carsHandle = null
+        uploaded.clear()
         cars.clear(); requests.clear(); active.clear()
         Alerts.resetAll(app)
-        val u = user?.takeIf { !it.isAnonymous }?.uid
         uid = u
         if (u == null) {
             Alerts.stopService(app)
@@ -102,6 +118,7 @@ object Repo {
         }
         cars.addAll(loadCars(u))
         attachAll()
+        watchCars(u)
         if (cars.isNotEmpty()) Alerts.startService(app)
     }
 
@@ -110,6 +127,14 @@ object Repo {
 
     /** Sign-out cleanup happens in onAuth(null): listeners, timers, notifications and the service all stop. */
     fun signOut() { auth.signOut() }
+
+    fun resetPassword(email: String, done: (String) -> Unit) {
+        val e = email.trim()
+        if (e.isEmpty()) return done("اكتب بريدك الإلكتروني أولًا")
+        auth.sendPasswordResetEmail(e).addOnCompleteListener { t ->
+            done(if (t.isSuccessful) "إذا كان البريد مسجلًا فستصلك رسالة لتغيير كلمة المرور" else authMessage(t.exception))
+        }
+    }
 
     private fun authCall(start: () -> Task<*>) {
         if (busy) return
@@ -139,7 +164,7 @@ object Repo {
         prefs.edit().putBoolean("repeat", v).apply()
     }
 
-    // ---------- cars (kept on this phone; the database only knows hash -> owner) ----------
+    // ---------- cars: cached on this phone, backed up under owners/<uid>/cars (readable by the owner only) ----------
     private fun loadCars(u: String): List<Car> = try {
         val arr = JSONArray(prefs.getString("cars:$u", "[]"))
         (0 until arr.length()).map {
@@ -160,43 +185,118 @@ object Repo {
     private fun linkValue(u: String, car: Car, on: Boolean): Map<String, Any> =
         mapOf("ownerUid" to u, "carId" to car.id, "active" to on)
 
+    private fun backupValue(car: Car): Map<String, Any> =
+        mapOf("label" to car.label, "token" to car.token, "updatedAt" to ServerValue.TIMESTAMP)
+
+    /** Keeps the local list equal to the backup, so a new or reinstalled phone gets its cars (and QR codes) back. */
+    private fun watchCars(u: String) {
+        val ref = db.getReference("owners/$u/cars")
+        val l = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) { onCarsBackup(u, snapshot) }
+            override fun onCancelled(error: DatabaseError) {}
+        }
+        ref.addValueEventListener(l)
+        carsHandle = { ref.removeEventListener(l) }
+    }
+
+    private fun onCarsBackup(u: String, snapshot: DataSnapshot) {
+        if (uid != u) return
+        var changed = false
+        val known = HashSet<String>()
+        snapshot.children.forEach { c ->
+            val id = c.key ?: return@forEach
+            known.add(id)
+            if (c.child("deleted").getValue(Boolean::class.java) == true) {
+                if (cars.removeAll { it.id == id }) changed = true
+                return@forEach
+            }
+            val label = c.child("label").getValue(String::class.java) ?: return@forEach
+            val token = c.child("token").getValue(String::class.java) ?: return@forEach
+            val car = Car(id, label, token)
+            val i = cars.indexOfFirst { it.id == id }
+            if (i < 0) {
+                cars.add(car); changed = true
+            } else if (cars[i] != car) {
+                cars[i] = car; changed = true
+            }
+        }
+        // Cars created by an older version exist only on this phone: upload each once.
+        cars.filter { it.id !in known }.forEach { car ->
+            if (uploaded.add(car.id)) carRef(u, car.id).setValue(backupValue(car))
+        }
+        if (changed) carsChanged()
+    }
+
+    private fun carRef(u: String, carId: String) = db.getReference("owners/$u/cars/$carId")
+
+    private fun carsChanged() {
+        saveCars()
+        reload()
+        if (cars.isEmpty()) Alerts.stopService(app) else Alerts.startService(app)
+    }
+
     fun addCar(label: String, done: (String?) -> Unit) {
         val u = uid ?: return done("سجّل الدخول أولًا")
         val clean = Strs.clean(label).take(60)
         if (clean.isEmpty()) return done("اكتب اسم السيارة")
+        if (!connected) return done(OFFLINE)
         val car = Car(Crypto.randomHex(8), clean, Crypto.newToken())
-        db.getReference("links/${car.hash}").setValue(linkValue(u, car, true))
+        uploaded.add(car.id)
+        db.reference.updateChildren(
+            mapOf(
+                "links/${car.hash}" to linkValue(u, car, true),
+                "owners/$u/cars/${car.id}" to backupValue(car),
+            ),
+        )
             .addOnSuccessListener {
-                cars.add(car); saveCars(); attachCar(car); Alerts.startService(app); done(null)
+                if (cars.none { it.id == car.id }) cars.add(car)
+                carsChanged(); done(null)
             }
-            .addOnFailureListener { done("تعذر إضافة السيارة. تحقق من الاتصال ومن قواعد قاعدة البيانات") }
+            .addOnFailureListener {
+                if (cars.removeAll { it.id == car.id }) carsChanged()
+                done("تعذر إضافة السيارة. تحقق من الاتصال ومن نشر قواعد قاعدة البيانات الجديدة")
+            }
     }
 
     fun setActive(car: Car, on: Boolean) {
         db.getReference("links/${car.hash}/active").setValue(on)
     }
 
-    /** New token for the same car: the printed QR stops working. Requests of the old link are no longer reachable. */
+    /**
+     * New token for the same car: the printed QR stops working. The old link is switched off, never removed,
+     * so nobody who scanned it can claim it later. Requests of the old link are no longer shown.
+     */
     fun rotate(car: Car, done: (String?) -> Unit) {
         val u = uid ?: return done("سجّل الدخول أولًا")
+        if (!connected) return done(OFFLINE)
         val fresh = Car(car.id, car.label, Crypto.newToken())
-        db.getReference("links/${fresh.hash}").setValue(linkValue(u, fresh, active[car.hash] != false))
+        db.reference.updateChildren(
+            mapOf(
+                "links/${fresh.hash}" to linkValue(u, fresh, active[car.hash] != false),
+                "links/${car.hash}/active" to false,
+                "owners/$u/cars/${car.id}" to backupValue(fresh),
+            ),
+        )
             .addOnSuccessListener {
-                db.getReference("links/${car.hash}").removeValue()
                 val i = cars.indexOfFirst { it.id == car.id }
                 if (i >= 0) cars[i] = fresh
-                saveCars(); reload(); done(null)
+                carsChanged(); done(null)
             }
             .addOnFailureListener { done("تعذر تغيير الرمز. تحقق من الاتصال") }
     }
 
     fun deleteCar(car: Car, done: (String?) -> Unit) {
-        db.getReference("links/${car.hash}").removeValue()
+        val u = uid ?: return done("سجّل الدخول أولًا")
+        if (!connected) return done(OFFLINE)
+        db.reference.updateChildren(
+            mapOf(
+                "links/${car.hash}/active" to false,
+                "owners/$u/cars/${car.id}" to mapOf("deleted" to true, "updatedAt" to ServerValue.TIMESTAMP),
+            ),
+        )
             .addOnSuccessListener {
                 cars.removeAll { it.id == car.id }
-                saveCars(); reload()
-                if (cars.isEmpty()) Alerts.stopService(app)
-                done(null)
+                carsChanged(); done(null)
             }
             .addOnFailureListener { done("تعذر حذف السيارة. تحقق من الاتصال") }
     }
@@ -205,11 +305,17 @@ object Repo {
     private fun detachAll() {
         handles.forEach { it() }
         handles.clear()
+        messageHandles.values.forEach { it() }
+        messageHandles.clear()
     }
 
     private fun reload() {
         detachAll()
+        // Requests of a removed or rotated link must not keep alerting.
+        val hashes = cars.map { it.hash }.toSet()
+        requests.filter { it.hash !in hashes }.forEach { Alerts.stop(app, it.id); Alerts.stopMessage(app, it.id) }
         requests.clear()
+        active.clear()
         attachAll()
     }
 
@@ -254,7 +360,35 @@ object Repo {
         list.forEach { r ->
             // Alerts keep going only while the owner has NOT opened the request (status stays "sent").
             if (r.isOpen(now) && r.status == "sent") Alerts.track(app, r) else Alerts.stop(app, r.id)
+            if (r.isOpen(now)) {
+                watchLastMessage(r)
+            } else {
+                messageHandles.remove(r.id)?.invoke()
+                Alerts.stopMessage(app, r.id)
+            }
         }
+    }
+
+    /** Notifies about a new visitor message in an open request while the owner is not looking at it. */
+    private fun watchLastMessage(r: Req) {
+        if (messageHandles.containsKey(r.id)) return
+        val q = db.getReference("messages/${r.hash}/${r.id}").orderByChild("createdAt").limitToLast(1)
+        val l = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val last = snapshot.children.lastOrNull() ?: return
+                if (last.child("from").getValue(String::class.java) != "visitor") {
+                    Alerts.stopMessage(app, r.id)
+                    return
+                }
+                val text = last.child("text").getValue(String::class.java) ?: return
+                val at = last.child("createdAt").getValue(Long::class.java) ?: return
+                val cur = current(r.id) ?: r
+                if (cur.isOpen(serverNow())) Alerts.message(app, cur, last.key ?: return, text, at)
+            }
+            override fun onCancelled(error: DatabaseError) {}
+        }
+        q.addValueEventListener(l)
+        messageHandles[r.id] = { q.removeEventListener(l) }
     }
 
     // ---------- actions on a request ----------
@@ -265,7 +399,7 @@ object Repo {
     fun sendMessage(r: Req, text: String, done: (String?) -> Unit) {
         val t = Strs.clean(text)
         if (t.isEmpty()) return done("اكتب رسالة أولًا")
-        if (t.codePointCount(0, t.length) > 500) return done("الرسالة طويلة (الحد 500 حرف)")
+        if (t.length > 500) return done("الرسالة طويلة (الحد 500 حرف)")
         db.getReference("messages/${r.hash}/${r.id}").push()
             .setValue(mapOf("from" to "owner", "text" to t, "createdAt" to ServerValue.TIMESTAMP))
             .addOnSuccessListener { done(null) }
