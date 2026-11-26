@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.Ringtone
 import android.media.RingtoneManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -21,44 +22,56 @@ import kotlinx.coroutines.launch
  * Incoming-request alerts. A new unopened request notifies immediately and then repeats at +30/+60/+90 s
  * (or once, if repeat is off) until the owner opens it, it is closed/cancelled, or its 15 minutes run out.
  * Runs on the main thread inside the process kept alive by AlertService.
+ *
+ * The sound is played by the app itself (playSound) on the alarm audio stream, NOT by the notification channel:
+ * on the owner's Xiaomi phone the channel-based sound stayed silent even after the channel was recreated.
+ * The channel is therefore silent (vibration only) so the two never overlap.
  */
 object Alerts {
     const val CHANNEL_SERVICE = "service"
 
-    /**
-     * Android never changes the sound of a channel after it was created, so a channel that was first created
-     * without a sound stays silent forever. The id was bumped from "requests" to get a fresh channel with a sound.
-     */
-    const val CHANNEL_REQUESTS = "requests_v2"
-    private const val OLD_CHANNEL_REQUESTS = "requests"
+    /** Android never changes a channel after it was created, so every change of channel settings needs a new id. */
+    const val CHANNEL_REQUESTS = "requests_v3"
+    private val OLD_REQUEST_CHANNELS = listOf("requests", "requests_v2")
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val jobs = HashMap<String, Job>()
     private val handled = HashSet<String>()
+    private var ringtone: Ringtone? = null
 
     fun ensureChannels(ctx: Context) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_SERVICE, "التطبيق يعمل في الخلفية", NotificationManager.IMPORTANCE_LOW),
         )
-        nm.deleteNotificationChannel(OLD_CHANNEL_REQUESTS)
+        OLD_REQUEST_CHANNELS.forEach { nm.deleteNotificationChannel(it) }
         val requests = NotificationChannel(CHANNEL_REQUESTS, "طلبات التواصل", NotificationManager.IMPORTANCE_HIGH).apply {
-            description = "تنبيه عند وصول طلب تواصل بخصوص سيارتك"
+            description = "تنبيه عند وصول طلب تواصل بخصوص سيارتك (الصوت يشغّله التطبيق نفسه)"
             enableVibration(true)
             vibrationPattern = longArrayOf(0, 400, 200, 400)
-            // Default notification sound; if the phone has none set, fall back to the ringtone, then the alarm sound.
+            setSound(null, null)
+        }
+        nm.createNotificationChannel(requests)
+    }
+
+    /** Plays the default notification sound (falls back to ringtone, then alarm) on the alarm stream. */
+    private fun playSound(ctx: Context) {
+        try {
+            ringtone?.stop()
             val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-            setSound(
-                uri,
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build(),
-            )
+                ?: return
+            val r = RingtoneManager.getRingtone(ctx.applicationContext, uri) ?: return
+            r.audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            r.play()
+            ringtone = r
+        } catch (e: Exception) {
+            // Sound is best effort; the notification and vibration still happen.
         }
-        nm.createNotificationChannel(requests)
     }
 
     /** Start escalating alerts for a request. Each request id is tracked once per sign-in. */
@@ -111,6 +124,7 @@ object Alerts {
         jobs.values.forEach { it.cancel() }
         jobs.clear()
         handled.clear()
+        try { ringtone?.stop() } catch (e: Exception) { }
         NotificationManagerCompat.from(ctx).cancelAll()
     }
 
@@ -142,6 +156,7 @@ object Alerts {
             .build()
         try {
             nm.notify(id, n)
+            playSound(ctx)
         } catch (e: SecurityException) {
             // POST_NOTIFICATIONS revoked while running: nothing to do.
         }
