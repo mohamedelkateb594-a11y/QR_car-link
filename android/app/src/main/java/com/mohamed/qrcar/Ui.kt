@@ -1,9 +1,13 @@
 package com.mohamed.qrcar
 
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -420,30 +424,110 @@ private fun RequestScreen(hash: String, rid: String) {
 }
 
 // ---------- settings ----------
+private fun appDetails(ctx: Context): Intent =
+    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", ctx.packageName, null))
+
+/** Opens a system screen; if the phone has no such screen, opens the fallback (usually the app's own settings page). */
+private fun openSafely(ctx: Context, intent: Intent, fallback: Intent? = null) {
+    try {
+        ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (e: Exception) {
+        try {
+            if (fallback != null) ctx.startActivity(fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e2: Exception) {
+            // Nothing else to open.
+        }
+    }
+}
+
 @Composable
 private fun SettingsScreen() {
     val ctx = LocalContext.current
+    var soundMsg by remember { mutableStateOf<String?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val err = Sound.saveCustom(ctx, uri)
+            if (err == null) Alerts.ensureChannels(ctx)
+            soundMsg = err ?: "تم تعيين الصوت. اضغط «تجربة التنبيه» لتسمعه."
+        }
+    }
     Page("الإعدادات", onBack = { Nav.screen = Screen.Home }) {
         Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("تكرار التنبيه (كل 30 ثانية حتى دقيقة ونصف) إذا لم تفتح الطلب", Modifier.weight(1f))
                 Switch(checked = Repo.repeatAlerts, onCheckedChange = { Repo.setRepeat(it) })
             }
+
+            // ----- alert sound -----
+            Spacer(Modifier.height(8.dp))
+            Text("صوت التنبيه", style = MaterialTheme.typography.titleMedium)
+            Text("الصوت الحالي: " + (Sound.customName ?: "نغمة التطبيق الافتراضية"))
+            Button(modifier = Modifier.fillMaxWidth(), onClick = { picker.launch(arrayOf("audio/*")) }) {
+                Text("اختيار ملف صوتي من الهاتف")
+            }
+            if (Sound.customName != null) {
+                OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
+                    Sound.clearCustom(ctx)
+                    Alerts.ensureChannels(ctx)
+                    soundMsg = "رجع الصوت إلى نغمة التطبيق الافتراضية."
+                }) { Text("الرجوع للنغمة الافتراضية") }
+            }
+            Button(modifier = Modifier.fillMaxWidth(), onClick = {
+                Alerts.test(ctx)
+                soundMsg = "أُرسل تنبيه تجريبي. إن لم تسمع صوتًا فعّل «تشغيل الصوت من التطبيق نفسه» أدناه ثم جرّب مرة أخرى."
+            }) { Text("تجربة التنبيه") }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("تشغيل الصوت من التطبيق نفسه (فعّله إن لم تسمع صوتًا). يعمل بمستوى صوت المنبّه.", Modifier.weight(1f))
+                Switch(checked = Sound.inApp, onCheckedChange = {
+                    Sound.setInApp(ctx, it)
+                    Alerts.ensureChannels(ctx)
+                })
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("إضاءة الشاشة لثوانٍ عند وصول طلب وهي مقفلة", Modifier.weight(1f))
+                Switch(checked = Sound.wake, onCheckedChange = { Sound.setWake(ctx, it) })
+            }
+            soundMsg?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
+                openSafely(
+                    ctx,
+                    Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                        .putExtra(Settings.EXTRA_CHANNEL_ID, Alerts.requestsChannelId()),
+                    appDetails(ctx),
+                )
+            }) { Text("إعدادات إشعارات الطلبات في الهاتف") }
+
+            // ----- phone setup so alerts arrive with the screen locked -----
+            Spacer(Modifier.height(8.dp))
+            Text("تجهيز الهاتف لتصلك التنبيهات والشاشة مقفلة", style = MaterialTheme.typography.titleMedium)
             Text(
-                "لضمان وصول التنبيهات والتطبيق مغلق: اسمح بالإشعارات، واستثنِ التطبيق من توفير البطارية، ولا تغلقه بالقوة. قد يكتم وضع «عدم الإزعاج» الصوت.",
+                "اسمح بالإشعارات، واستثنِ التطبيق من توفير البطارية، وفعّل التشغيل التلقائي، ولا تغلق التطبيق بالقوة. قد يكتم وضع «عدم الإزعاج» الصوت.",
                 style = MaterialTheme.typography.bodySmall,
             )
             OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
-                ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            }) { Text("إعدادات توفير البطارية") }
+                openSafely(ctx, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS), appDetails(ctx))
+            }) { Text("استثناء التطبيق من توفير البطارية") }
             OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
-                ctx.startActivity(
-                    Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
-                        .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
-                        .putExtra(Settings.EXTRA_CHANNEL_ID, Alerts.CHANNEL_REQUESTS)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                openSafely(
+                    ctx,
+                    Intent().setClassName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
+                    appDetails(ctx),
                 )
-            }) { Text("صوت وأهمية إشعارات الطلبات") }
+            }) { Text("التشغيل التلقائي (شاومي)") }
+            OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
+                openSafely(
+                    ctx,
+                    Intent("miui.intent.action.APP_PERM_EDITOR")
+                        .setClassName("com.miui.securitycenter", "com.miui.permcenter.permissions.PermissionsEditorActivity")
+                        .putExtra("extra_pkgname", ctx.packageName),
+                    appDetails(ctx),
+                )
+            }) { Text("أذونات التطبيق: شاشة القفل والنوافذ المنبثقة (شاومي)") }
+            OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
+                openSafely(ctx, appDetails(ctx))
+            }) { Text("إعدادات التطبيق في الهاتف") }
+
             Spacer(Modifier.height(16.dp))
             Button(modifier = Modifier.fillMaxWidth(), onClick = {
                 Nav.screen = Screen.Home
